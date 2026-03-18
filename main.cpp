@@ -7,11 +7,12 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <arm_neon.h>
 
 // ==========================================
-// DECLARAȚII DE BAZĂ (Acum pe 32-bit float)
+// DECLARAȚII DE BAZĂ (32-bit float)
 // ==========================================
-typedef std::complex<float> Complex; // Modificat la float
+typedef std::complex<float> Complex;
 const float PI = 3.14159265358979323846f;
 
 #pragma pack(push, 1)
@@ -38,11 +39,9 @@ struct WavHeader {
 std::vector<float> citeste_wav(const std::string& nume_fisier, WavHeader& header_salvat) {
     std::ifstream fisier(nume_fisier, std::ios::binary);
     std::vector<float> semnal_audio;
-
     if (!fisier.is_open()) return semnal_audio;
 
     fisier.read(reinterpret_cast<char*>(&header_salvat), 36);
-
     char chunk_id[5] = {0};
     uint32_t chunk_size;
     bool data_gasit = false;
@@ -63,11 +62,9 @@ std::vector<float> citeste_wav(const std::string& nume_fisier, WavHeader& header
 
     int num_esantioane = header_salvat.data_bytes / (header_salvat.bit_depth / 8);
     semnal_audio.reserve(num_esantioane);
-
     int16_t esantion_brut;
     for (int i = 0; i < num_esantioane; i++) {
         if (fisier.read(reinterpret_cast<char*>(&esantion_brut), sizeof(int16_t))) {
-            // Impartim la 32768.0f pentru float
             semnal_audio.push_back(static_cast<float>(esantion_brut) / 32768.0f);
         } else break;
     }
@@ -84,14 +81,12 @@ void scrie_wav(const std::string& nume_fisier, const std::vector<float>& semnal_
     header.data_bytes = semnal_audio.size() * (header.bit_depth / 8);
     header.wav_size = header.data_bytes + 36;
     std::memcpy(header.data_header, "data", 4);
-
     fisier.write(reinterpret_cast<const char*>(&header), sizeof(WavHeader));
 
     for (size_t i = 0; i < semnal_audio.size(); i++) {
         float valoare = semnal_audio[i];
         if (valoare > 1.0f) valoare = 1.0f;
         if (valoare < -1.0f) valoare = -1.0f;
-
         int16_t esantion_final = static_cast<int16_t>(valoare * 32767.0f);
         fisier.write(reinterpret_cast<const char*>(&esantion_final), sizeof(int16_t));
     }
@@ -100,24 +95,55 @@ void scrie_wav(const std::string& nume_fisier, const std::vector<float>& semnal_
 }
 
 // ==========================================
-// MODULUL DSP: FFT ȘI FIR (VARIANTE NAIVE FLOAT)
+// MODULUL FILTER DESIGN (Matematica FIR)
+// ==========================================
+std::vector<float> genereaza_filtru_trece_jos(float frecventa_taiere, float sample_rate, int numar_coeficienti) {
+    std::vector<float> coeficienti(numar_coeficienti, 0.0f);
+    
+    // Frecvența normalizată
+    float ft = frecventa_taiere / sample_rate;
+    int M = numar_coeficienti - 1;
+    float suma = 0.0f;
+
+    for (int n = 0; n < numar_coeficienti; n++) {
+        // Calculăm funcția ideală Sinc
+        if (n == M / 2) {
+            coeficienti[n] = 2.0f * ft;
+        } else {
+            float x = PI * (n - M / 2.0f);
+            coeficienti[n] = sinf(2.0f * PI * ft * (n - M / 2.0f)) / x;
+        }
+
+        // Aplicăm Fereastra Hamming pentru a elimina distorsiunile
+        float fereastra_hamming = 0.54f - 0.46f * cosf((2.0f * PI * n) / M);
+        coeficienti[n] *= fereastra_hamming;
+
+        suma += coeficienti[n];
+    }
+
+    // Normalizăm coeficienții (ca să nu modificăm volumul general al piesei)
+    for (int n = 0; n < numar_coeficienti; n++) {
+        coeficienti[n] /= suma;
+    }
+
+    return coeficienti;
+}
+
+// ==========================================
+// MODULUL DSP (Funcții cu memorie optimizată)
 // ==========================================
 void fft_naiv(std::vector<Complex>& a) {
     int n = a.size();
     if (n <= 1) return;
-
     std::vector<Complex> pare(n / 2), impare(n / 2);
     for (int i = 0; i < n / 2; i++) {
         pare[i] = a[i * 2];
         impare[i] = a[i * 2 + 1];
     }
-
     fft_naiv(pare);
     fft_naiv(impare);
-
     float angle = -2.0f * PI / n;
-    Complex w(1.0f, 0.0f), wn(cos(angle), sin(angle));
-    
+    Complex w(1.0f, 0.0f), wn(cosf(angle), sinf(angle));
     for (int i = 0; i < n / 2; i++) {
         a[i] = pare[i] + w * impare[i];
         a[i + n / 2] = pare[i] - w * impare[i];
@@ -125,26 +151,56 @@ void fft_naiv(std::vector<Complex>& a) {
     }
 }
 
-std::vector<float> fir_naiv(const std::vector<float>& semnal_intrare, const std::vector<float>& coeficienti) {
-    int n_semnal = semnal_intrare.size();
-    int n_coeficienti = coeficienti.size();
-    std::vector<float> semnal_iesire(n_semnal, 0.0f);
+void fir_naiv(const std::vector<float>& intrare, const std::vector<float>& coef, std::vector<float>& iesire) {
+    int n_semnal = intrare.size();
+    int n_coeficienti = coef.size();
+    std::fill(iesire.begin(), iesire.end(), 0.0f);
 
     for (int i = 0; i < n_semnal; i++) {
         for (int j = 0; j < n_coeficienti; j++) {
             if (i - j >= 0) {
-                semnal_iesire[i] += semnal_intrare[i - j] * coeficienti[j];
+                iesire[i] += intrare[i - j] * coef[j];
             }
         }
     }
-    return semnal_iesire;
+}
+
+void fir_neon(const std::vector<float>& intrare, const std::vector<float>& coef, std::vector<float>& iesire) {
+    int n_semnal = intrare.size();
+    int n_coeficienti = coef.size();
+    std::fill(iesire.begin(), iesire.end(), 0.0f);
+
+    for (int i = 0; i < n_coeficienti - 1; i++) {
+        for (int j = 0; j < n_coeficienti; j++) {
+            if (i - j >= 0) {
+                iesire[i] += intrare[i - j] * coef[j];
+            }
+        }
+    }
+
+    int i = n_coeficienti - 1;
+    for (; i <= n_semnal - 4; i += 4) {
+        float32x4_t acumulator = vdupq_n_f32(0.0f);
+        for (int j = 0; j < n_coeficienti; j++) {
+            float32x4_t coef_vec = vdupq_n_f32(coef[j]);
+            float32x4_t semnal_vec = vld1q_f32(&intrare[i - j]);
+            acumulator = vmlaq_f32(acumulator, semnal_vec, coef_vec);
+        }
+        vst1q_f32(&iesire[i], acumulator);
+    }
+
+    for (; i < n_semnal; i++) {
+        for (int j = 0; j < n_coeficienti; j++) {
+            iesire[i] += intrare[i - j] * coef[j];
+        }
+    }
 }
 
 // ==========================================
 // FUNCȚIA PRINCIPALĂ
 // ==========================================
 int main() {
-    std::cout << "=== Pipeline DSP Audio (Varianta FLOAT Naiva) ===" << std::endl;
+    std::cout << "=== Pipeline DSP Audio (C++ vs ARM NEON) ===" << std::endl;
 
     std::string fisier_intrare = "test_audio.wav"; 
     std::string fisier_iesire = "audio_filtrat.wav";
@@ -154,34 +210,69 @@ int main() {
     std::vector<float> semnal_original = citeste_wav(fisier_intrare, header_audio);
     if (semnal_original.empty()) return 1;
 
-    std::vector<float> coeficienti_fir(11, 1.0f / 11.0f); 
+    // Buffer comun pentru rezultate (Optimizare Memorie RAM)
+    std::vector<float> buffer_iesire(semnal_original.size(), 0.0f);
 
-    std::cout << "\n[2] Procesare filtru FIR pe " << semnal_original.size() << " esantioane..." << std::endl;
+    // ---------------------------------------------------------
+    // GENERARE COEFICIENȚI EGALIZATOR (Windowed-Sinc)
+    // ---------------------------------------------------------
+    float frecventa_taiere = 400.0f; // Taiem tot ce e peste 400 Hz (pastram doar basul)
+    int numar_coeficienti = 101;     // Filtru precis, de ordinul 100
+    float sample_rate = header_audio.sample_rate;
+
+    std::cout << "\n[2] Generez filtru Trece-Jos profesional..." << std::endl;
+    std::cout << "    -> Frecventa taiere: " << frecventa_taiere << " Hz" << std::endl;
+    std::cout << "    -> Numar coeficienti: " << numar_coeficienti << std::endl;
+
+    std::vector<float> coeficienti_fir = genereaza_filtru_trece_jos(frecventa_taiere, sample_rate, numar_coeficienti);
+
+    // ---------------------------------------------------------
+    // RULAM VARIANTA NAIVA
+    // ---------------------------------------------------------
+    std::cout << "\n[3.A] Procesare FIR NAIV pe " << semnal_original.size() << " esantioane..." << std::endl;
     auto start_fir = std::chrono::high_resolution_clock::now();
     
-    std::vector<float> semnal_filtrat = fir_naiv(semnal_original, coeficienti_fir);
+    fir_naiv(semnal_original, coeficienti_fir, buffer_iesire);
     
     auto stop_fir = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> durata_fir = stop_fir - start_fir;
-    std::cout << "-> TIMP EXECUTIE FIR NAIV: " << durata_fir.count() << " milisecunde." << std::endl;
+    std::cout << "-> TIMP EXECUTIE FIR NAIV: " << durata_fir.count() << " ms." << std::endl;
 
-    std::cout << "\n[3] Analiza FFT (cadru 1024 esantioane)..." << std::endl;
+    // ---------------------------------------------------------
+    // RULAM VARIANTA NEON
+    // ---------------------------------------------------------
+    std::cout << "\n[3.B] Procesare FIR OPTIMIZAT CU NEON..." << std::endl;
+    auto start_neon = std::chrono::high_resolution_clock::now();
+    
+    fir_neon(semnal_original, coeficienti_fir, buffer_iesire);
+    
+    auto stop_neon = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> durata_neon = stop_neon - start_neon;
+    std::cout << "-> TIMP EXECUTIE FIR NEON: " << durata_neon.count() << " ms." << std::endl;
+    
+    double speedup = durata_fir.count() / durata_neon.count();
+    std::cout << "-> ACCELERARE (SPEEDUP): " << speedup << "x mai rapid!" << std::endl;
+
+    // ---------------------------------------------------------
+    // FFT SI SALVARE
+    // ---------------------------------------------------------
+    std::cout << "\n[4] Analiza FFT (cadru 1024 esantioane)..." << std::endl;
     int dimensiune_cadru = 1024;
     std::vector<Complex> cadru_fft(dimensiune_cadru, Complex(0.0f, 0.0f));
     
-    int limita = std::min(dimensiune_cadru, (int)semnal_filtrat.size());
+    int limita = std::min(dimensiune_cadru, (int)buffer_iesire.size());
     for (int i = 0; i < limita; i++) {
-        cadru_fft[i] = Complex(semnal_filtrat[i], 0.0f);
+        cadru_fft[i] = Complex(buffer_iesire[i], 0.0f);
     }
 
     auto start_fft = std::chrono::high_resolution_clock::now();
     fft_naiv(cadru_fft);
     auto stop_fft = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> durata_fft = stop_fft - start_fft;
-    std::cout << "-> TIMP EXECUTIE FFT NAIV: " << durata_fft.count() << " milisecunde." << std::endl;
+    std::cout << "-> TIMP EXECUTIE FFT NAIV: " << durata_fft.count() << " ms." << std::endl;
 
-    std::cout << "\n[4] Salvare fisier modificat..." << std::endl;
-    scrie_wav(fisier_iesire, semnal_filtrat, header_audio);
+    std::cout << "\n[5] Salvare fisier modificat..." << std::endl;
+    scrie_wav(fisier_iesire, buffer_iesire, header_audio);
 
     std::cout << "\n=== Pipeline Finalizat ===" << std::endl;
     return 0;
