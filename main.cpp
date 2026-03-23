@@ -211,39 +211,53 @@ void fft_neon(std::vector<Complex>& a) {
 }
 
 // Interfata vizuala in terminal
-void afiseaza_spectru_ascii(const std::vector<Complex>& date_fft, int sample_rate) {
-    int n = date_fft.size() / 2; // Afisam doar frecventele utile (pana la Nyquist)
+void afiseaza_spectru_ascii(const std::vector<Complex>& date_fft, int sample_rate, const std::string& titlu) {
+    int n = date_fft.size() / 2; 
     const int N_BENZI = 8;
     float magnitudini_benzi[N_BENZI] = {0};
     int samples_per_band = n / N_BENZI;
 
-    std::cout << "\n--- ANALIZOR DE SPECTRU (ASCII View) ---\n";
+    std::cout << "\n=== " << titlu << " ===\n";
 
+    // 1. Calculam magnitudinea pe fiecare banda si gasim maximul pentru Auto-Scalare
+    float max_mag = 0.0001f;
     for (int b = 0; b < N_BENZI; b++) {
         float suma = 0;
         for (int i = 0; i < samples_per_band; i++) {
             Complex c = date_fft[b * samples_per_band + i];
-            // Calculam magnitudinea: sqrt(real^2 + imag^2)
             suma += std::sqrt(c.real() * c.real() + c.imag() * c.imag());
         }
+        magnitudini_benzi[b] = suma / samples_per_band;
+        if (magnitudini_benzi[b] > max_mag) {
+            max_mag = magnitudini_benzi[b];
+        }
+    }
+
+    // 2. Etichete detaliate pentru frecvente
+    const std::string etichete[N_BENZI] = {
+        "SUB-BASS (20-60Hz)  ",
+        "BASS     (60-250Hz) ",
+        "LOW-MID  (250-500Hz)",
+        "MID      (500-2kHz) ",
+        "UP-MID   (2k-4kHz)  ",
+        "PRESENCE (4k-6kHz)  ",
+        "BRILLIANCE(6k-10kHz)",
+        "HIGH     (10k-20kHz)"
+    };
+
+    // 3. Desenam graficul proportional cu frecventa maxima gasita
+    for (int b = 0; b < N_BENZI; b++) {
+        // Mapam valoarea raportata la maxim, pe o lungime de 40 de caractere
+        int lungime_bara = static_cast<int>((magnitudini_benzi[b] / max_mag) * 40.0f);
         
-        // Media pe bandă + un factor de scalare (mareste 20.0f dacă barele sunt prea mici)
-        magnitudini_benzi[b] = (suma / samples_per_band) * 20.0f; 
-
-        int lungime_bara = static_cast<int>(magnitudini_benzi[b]);
-        if (lungime_bara > 40) lungime_bara = 40; // Limităm vizual la 40 de caractere
-
-        std::string eticheta;
-        if (b == 0) eticheta = "SUB-BASS";
-        else if (b == 1) eticheta = "BASS    ";
-        else if (b < 5) eticheta = "MID     ";
-        else eticheta = "HIGH    ";
-
-        std::cout << eticheta << " |";
+        std::cout << etichete[b] << " |";
         for (int i = 0; i < lungime_bara; i++) std::cout << "█";
+        
+        // Un mic artificiu vizual: adaugam un pointer la capăt
+        if (lungime_bara > 0) std::cout << "▌"; 
         std::cout << "\n";
     }
-    std::cout << "----------------------------------------\n";
+    std::cout << "--------------------------------------------------\n";
 }
 
 void fir_neon(const std::vector<float>& intrare, const std::vector<float>& coef, std::vector<float>& iesire) {
@@ -338,26 +352,31 @@ int main() {
     // FFT SI SALVARE
     // ---------------------------------------------------------
 
-    std::cout << "\n[4] Analiza FFT iterativ (cadru 1024 esantioane)..." << std::endl;
+    std::cout << "\n[4.A] Analiza FFT (INAINTE de filtrare) pe un cadru de 1024 esantioane..." << std::endl;
     int dimensiune_cadru = 1024;
-    std::vector<Complex> cadru_fft(dimensiune_cadru, Complex(0.0f, 0.0f));
     
-    int limita = std::min(dimensiune_cadru, (int)buffer_iesire.size());
-    for (int i = 0; i < limita; i++) {
-        cadru_fft[i] = Complex(buffer_iesire[i], 0.0f);
+    // Sarim la jumatatea melodiei
+    int start_idx = semnal_original.size() / 2;
+    
+    std::vector<Complex> cadru_fft_inainte(dimensiune_cadru, Complex(0.0f, 0.0f));
+    int limita_inainte = std::min(dimensiune_cadru, (int)semnal_original.size() - start_idx);
+    for (int i = 0; i < limita_inainte; i++) {
+        cadru_fft_inainte[i] = Complex(semnal_original[start_idx + i], 0.0f);
     }
 
-    auto start_fft = std::chrono::high_resolution_clock::now();
-    
-    // Rulam varianta nouă, iterativa
-    fft_neon(cadru_fft); 
-    
-    auto stop_fft = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> durata_fft = stop_fft - start_fft;
-    std::cout << "-> TIMP EXECUTIE FFT (Iterativ): " << durata_fft.count() << " ms." << std::endl;
+    fft_neon(cadru_fft_inainte); 
+    afiseaza_spectru_ascii(cadru_fft_inainte, header_audio.sample_rate, "SPECTRU ORIGINAL (Inainte de Filtrare)");
 
-    // Afisam graficul cu bare în terminal
-    afiseaza_spectru_ascii(cadru_fft, header_audio.sample_rate);
+    std::cout << "\n[4.B] Analiza FFT (DUPA filtrare) pe acelasi cadru..." << std::endl;
+    
+    std::vector<Complex> cadru_fft_dupa(dimensiune_cadru, Complex(0.0f, 0.0f));
+    int limita_dupa = std::min(dimensiune_cadru, (int)buffer_iesire.size() - start_idx);
+    for (int i = 0; i < limita_dupa; i++) {
+        cadru_fft_dupa[i] = Complex(buffer_iesire[start_idx + i], 0.0f);
+    }
+
+    fft_neon(cadru_fft_dupa); 
+    afiseaza_spectru_ascii(cadru_fft_dupa, header_audio.sample_rate, "SPECTRU FILTRAT (Dupa FIR NEON)");
 
     std::cout << "\n[5] Salvare fisier modificat..." << std::endl;
     scrie_wav(fisier_iesire, buffer_iesire, header_audio);
