@@ -165,6 +165,87 @@ void fir_naiv(const std::vector<float>& intrare, const std::vector<float>& coef,
     }
 }
 
+// ==========================================
+// FFT ITERATIV & VIZUALIZARE ASCII
+// ==========================================
+
+// Bit-Reversal
+uint32_t reverse_bits(uint32_t x, int n) {
+    uint32_t res = 0;
+    for (int i = 0; i < n; i++) {
+        res = (res << 1) | (x & 1);
+        x >>= 1;
+    }
+    return res;
+}
+
+// FFT Iterativ (Cooley-Tukey) - Structura pregătită pentru NEON
+void fft_neon(std::vector<Complex>& a) {
+    int n = a.size();
+    int log_n = log2(n);
+
+    // 1. Permutarea datelor
+    for (int i = 0; i < n; i++) {
+        int j = reverse_bits(i, log_n);
+        if (i < j) std::swap(a[i], a[j]);
+    }
+
+    // 2. Calculul propriu-zis (fara recursivitate)
+    for (int len = 2; len <= n; len <<= 1) {
+        float angle = -2.0f * PI / len;
+        Complex wlen(cosf(angle), sinf(angle));
+        
+        for (int i = 0; i < n; i += len) {
+            Complex w(1, 0);
+            for (int j = 0; j < len / 2; j++) {
+                //Aici 'asezam' baza pentru vectorizarea fluturelui 
+                //cu float32x4_t (vld1q_f32, vmulq_f32) in etapa de rafinare extrema.
+                Complex u = a[i + j];
+                Complex v = a[i + j + len / 2] * w;
+                a[i + j] = u + v;
+                a[i + j + len / 2] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+}
+
+// Interfata vizuala in terminal
+void afiseaza_spectru_ascii(const std::vector<Complex>& date_fft, int sample_rate) {
+    int n = date_fft.size() / 2; // Afisam doar frecventele utile (pana la Nyquist)
+    const int N_BENZI = 8;
+    float magnitudini_benzi[N_BENZI] = {0};
+    int samples_per_band = n / N_BENZI;
+
+    std::cout << "\n--- ANALIZOR DE SPECTRU (ASCII View) ---\n";
+
+    for (int b = 0; b < N_BENZI; b++) {
+        float suma = 0;
+        for (int i = 0; i < samples_per_band; i++) {
+            Complex c = date_fft[b * samples_per_band + i];
+            // Calculam magnitudinea: sqrt(real^2 + imag^2)
+            suma += std::sqrt(c.real() * c.real() + c.imag() * c.imag());
+        }
+        
+        // Media pe bandă + un factor de scalare (mareste 20.0f dacă barele sunt prea mici)
+        magnitudini_benzi[b] = (suma / samples_per_band) * 20.0f; 
+
+        int lungime_bara = static_cast<int>(magnitudini_benzi[b]);
+        if (lungime_bara > 40) lungime_bara = 40; // Limităm vizual la 40 de caractere
+
+        std::string eticheta;
+        if (b == 0) eticheta = "SUB-BASS";
+        else if (b == 1) eticheta = "BASS    ";
+        else if (b < 5) eticheta = "MID     ";
+        else eticheta = "HIGH    ";
+
+        std::cout << eticheta << " |";
+        for (int i = 0; i < lungime_bara; i++) std::cout << "█";
+        std::cout << "\n";
+    }
+    std::cout << "----------------------------------------\n";
+}
+
 void fir_neon(const std::vector<float>& intrare, const std::vector<float>& coef, std::vector<float>& iesire) {
     int n_semnal = intrare.size();
     int n_coeficienti = coef.size();
@@ -256,7 +337,35 @@ int main() {
     // ---------------------------------------------------------
     // FFT SI SALVARE
     // ---------------------------------------------------------
-    std::cout << "\n[4] Analiza FFT (cadru 1024 esantioane)..." << std::endl;
+
+    std::cout << "\n[4] Analiza FFT iterativ (cadru 1024 esantioane)..." << std::endl;
+    int dimensiune_cadru = 1024;
+    std::vector<Complex> cadru_fft(dimensiune_cadru, Complex(0.0f, 0.0f));
+    
+    int limita = std::min(dimensiune_cadru, (int)buffer_iesire.size());
+    for (int i = 0; i < limita; i++) {
+        cadru_fft[i] = Complex(buffer_iesire[i], 0.0f);
+    }
+
+    auto start_fft = std::chrono::high_resolution_clock::now();
+    
+    // Rulam varianta nouă, iterativa
+    fft_neon(cadru_fft); 
+    
+    auto stop_fft = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> durata_fft = stop_fft - start_fft;
+    std::cout << "-> TIMP EXECUTIE FFT (Iterativ): " << durata_fft.count() << " ms." << std::endl;
+
+    // Afisam graficul cu bare în terminal
+    afiseaza_spectru_ascii(cadru_fft, header_audio.sample_rate);
+
+    std::cout << "\n[5] Salvare fisier modificat..." << std::endl;
+    scrie_wav(fisier_iesire, buffer_iesire, header_audio);
+
+    std::cout << "\n=== Pipeline Finalizat ===" << std::endl;
+    return 0;
+
+    /*std::cout << "\n[4] Analiza FFT (cadru 1024 esantioane)..." << std::endl;
     int dimensiune_cadru = 1024;
     std::vector<Complex> cadru_fft(dimensiune_cadru, Complex(0.0f, 0.0f));
     
@@ -276,4 +385,5 @@ int main() {
 
     std::cout << "\n=== Pipeline Finalizat ===" << std::endl;
     return 0;
+    */
 }
