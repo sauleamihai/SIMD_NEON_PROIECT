@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSP Audio Pipeline</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg0: #0a0c0f;
+    --bg1: #10141a;
+    --bg2: #161c26;
+    --bg3: #1e2736;
+    --border: rgba(0,220,180,0.15);
+    --accent: #00dcb4;
+    --accent2: #0088ff;
+    --accent3: #ff6b35;
+    --text: #c8d8e8;
+    --muted: #5a7080;
+    --mono: 'Share Tech Mono', monospace;
+    --ui: 'Rajdhani', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg0);
+    color: var(--text);
+    font-family: var(--ui);
+    font-size: 15px;
+    line-height: 1.5;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  /* ── HEADER ── */
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg1);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo-mark {
+    width: 28px; height: 28px;
+    border: 1.5px solid var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .status-pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 2px;
+    letter-spacing: 0.06em;
+    border: 1px solid;
+    transition: all 0.3s;
+  }
+  .status-pill.idle    { color: var(--muted); border-color: var(--muted); }
+  .status-pill.running { color: #fbbf24; border-color: #fbbf24; animation: blink 0.8s step-end infinite; }
+  .status-pill.ok      { color: var(--accent); border-color: var(--accent); }
+  .status-pill.err     { color: var(--accent3); border-color: var(--accent3); }
+
+  @keyframes blink { 50% { opacity: 0.3; } }
+
+  /* ── LAYOUT ── */
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+
+  .grid-top {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  @media (max-width: 680px) {
+    .grid-top { grid-template-columns: 1fr; }
+  }
+
+  /* ── PANELS ── */
+  .panel {
+    background: var(--bg1);
+    border: 1px solid var(--border);
+    padding: 16px 18px;
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .panel-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .panel-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+  }
+
+  /* ── UPLOAD ── */
+  .drop-zone {
+    border: 1px dashed rgba(0,220,180,0.3);
+    padding: 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+  }
+  .drop-zone:hover, .drop-zone.over {
+    border-color: var(--accent);
+    background: rgba(0,220,180,0.04);
+  }
+  .drop-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer;
+  }
+  .drop-icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+    color: var(--muted);
+  }
+  .drop-text {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .drop-text strong {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  #file-name {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    margin-top: 8px;
+    min-height: 16px;
+  }
+
+  /* ── BUTTONS ── */
+  .btn {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    padding: 9px 20px;
+    cursor: pointer;
+    border: 1px solid;
+    background: transparent;
+    transition: all 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .btn-primary {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .btn-primary:hover {
+    background: rgba(0,220,180,0.08);
+  }
+  .btn-primary:active { transform: scale(0.97); }
+  .btn-primary:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .btn-sec {
+    color: var(--accent2);
+    border-color: rgba(0,136,255,0.4);
+  }
+  .btn-sec:hover {
+    background: rgba(0,136,255,0.07);
+  }
+
+  /* ── LOG CONSOLE ── */
+  .log-box {
+    background: #070a0d;
+    border: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.7;
+    padding: 12px 14px;
+    height: 180px;
+    overflow-y: auto;
+    color: #7fa8b8;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-box .log-ok  { color: var(--accent); }
+  .log-box .log-err { color: var(--accent3); }
+  .log-box .log-info { color: #7fa8b8; }
+  .log-cursor {
+    display: inline-block;
+    width: 7px; height: 13px;
+    background: var(--accent);
+    animation: blink 1s step-end infinite;
+    vertical-align: text-bottom;
+  }
+
+  /* ── SPECTRUM VISUALIZER ── */
+  #spectrum-canvas {
+    width: 100%;
+    height: 200px;
+    display: block;
+    background: transparent;
+  }
+
+  /* ── WAVEFORM ── */
+  #wave-canvas {
+    width: 100%;
+    height: 120px;
+    display: block;
+    background: transparent;
+  }
+
+  /* ── AUDIO PLAYER ── */
+  .player-wrap {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+
+  .player-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .player-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  .audio-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+
+  .play-btn {
+    width: 38px; height: 38px;
+    border: 1.5px solid var(--accent);
+    background: transparent;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent);
+    font-size: 14px;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .play-btn:hover { background: rgba(0,220,180,0.1); }
+  .play-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .seek-track {
+    flex: 1;
+    position: relative;
+    height: 4px;
+    background: var(--bg3);
+    cursor: pointer;
+  }
+  .seek-fill {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.1s;
+    pointer-events: none;
+  }
+  .seek-thumb {
+    position: absolute;
+    top: 50%; transform: translateY(-50%);
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    left: 0%;
+    transition: left 0.1s;
+    pointer-events: none;
+  }
+
+  .time-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 82px;
+    text-align: right;
+  }
+
+  .vol-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .vol-icon {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  input[type=range].vol-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 90px;
+    height: 3px;
+    background: var(--bg3);
+    outline: none;
+    cursor: pointer;
+  }
+  input[type=range].vol-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px; height: 12px;
+    background: var(--accent2);
+    border-radius: 50%;
+    cursor: pointer;
+  }
+
+  /* ── TABS ── */
+  .tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .tab {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 8px 16px;
+    cursor: pointer;
+    color: var(--muted);
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  /* ── STATS BAR ── */
+  .stats-row {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .stat-cell {
+    flex: 1;
+    padding: 10px 14px;
+    border-right: 1px solid var(--border);
+  }
+  .stat-cell:last-child { border-right: none; }
+  .stat-val {
+    font-family: var(--mono);
+    font-size: 18px;
+    color: var(--accent);
+    display: block;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  /* ── COMPARE TOGGLE ── */
+  .compare-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .compare-btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 14px;
+    border: 1px solid;
+    background: transparent;
+    cursor: pointer;
+    letter-spacing: 0.06em;
+    transition: all 0.15s;
+  }
+  .compare-btn.active-orig {
+    color: var(--accent2);
+    border-color: var(--accent2);
+    background: rgba(0,136,255,0.08);
+  }
+  .compare-btn.active-filt {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(0,220,180,0.08);
+  }
+  .compare-btn:not(.active-orig):not(.active-filt) {
+    color: var(--muted);
+    border-color: rgba(90,112,128,0.3);
+  }
+  .compare-btn:hover {
+    opacity: 0.8;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: var(--bg0); }
+  ::-webkit-scrollbar-thumb { background: rgba(0,220,180,0.2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-mark">DSP</div>
+    ARM NEON Audio Pipeline &nbsp;·&nbsp; Pi Zero 2W
+  </div>
+  <div class="status-pill idle" id="status-pill">IDLE</div>
+</header>
+
+<div class="container">
+
+  <!-- STATS ROW -->
+  <div class="stats-row" id="stats-row">
+    <div class="stat-cell">
+      <span class="stat-val" id="stat-sr">—</span>
+      <span class="stat-label">Sample Rate</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-val" id="stat-dur">—</span>
+      <span class="stat-label">Duration</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-val" id="stat-fir">—</span>
+      <span class="stat-label">FIR (naive)</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-val" id="stat-neon">—</span>
+      <span class="stat-label">FIR (NEON)</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-val" id="stat-speedup">—</span>
+      <span class="stat-label">Speedup</span>
+    </div>
+  </div>
+
+  <!-- TOP GRID -->
+  <div class="grid-top">
+
+    <!-- LEFT: Upload + Run -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Input</span>
+        <span class="panel-tag">WAV · PCM16</span>
+      </div>
+
+      <div class="drop-zone" id="drop-zone">
+        <input type="file" id="file-input" accept=".wav">
+        <div class="drop-icon">⬡</div>
+        <div class="drop-text">Drop <strong>.wav</strong> here or click to browse</div>
+        <div id="file-name"></div>
+      </div>
+
+      <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-primary" id="run-btn" disabled>
+          <span id="run-icon">▶</span> RUN PIPELINE
+        </button>
+        <button class="btn btn-sec" id="refresh-btn" disabled>↻ REFRESH DATA</button>
+      </div>
+    </div>
+
+    <!-- RIGHT: Console log -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Console</span>
+        <button class="btn btn-sec" onclick="clearLog()" style="padding:3px 10px; font-size:10px;">CLR</button>
+      </div>
+      <div class="log-box" id="log-box">
+<span class="log-info">// DSP Pipeline ready. Upload a WAV and press RUN.
+</span><span class="log-cursor"></span></div>
+    </div>
+
+  </div>
+
+  <!-- AUDIO PLAYER -->
+  <div class="player-wrap" id="player-section" style="display:none;">
+    <div class="player-label">Playback</div>
+
+    <div class="compare-row">
+      <button class="compare-btn" id="btn-orig" onclick="switchAudio('original')">ORIGINAL</button>
+      <button class="compare-btn active-filt" id="btn-filt" onclick="switchAudio('filtered')">FILTRAT (LPF 400Hz)</button>
+    </div>
+
+    <div class="audio-row">
+      <button class="play-btn" id="play-btn" onclick="togglePlay()">▶</button>
+      <div class="seek-track" id="seek-track" onclick="seekTo(event)">
+        <div class="seek-fill" id="seek-fill"></div>
+        <div class="seek-thumb" id="seek-thumb"></div>
+      </div>
+      <div class="time-label" id="time-label">0:00 / 0:00</div>
+    </div>
+
+    <div class="vol-row">
+      <span class="vol-icon">🔈</span>
+      <input type="range" class="vol-slider" min="0" max="1" step="0.01" value="1"
+             oninput="setVolume(this.value)">
+      <span class="vol-icon">🔊</span>
+    </div>
+
+    <audio id="audio-el" preload="auto"></audio>
+  </div>
+
+  <!-- SPECTRUM + WAVEFORM -->
+  <div class="panel" style="margin-bottom:16px;">
+    <div class="panel-header">
+      <span class="panel-title">Spectru FFT</span>
+      <div style="display:flex; gap:6px;">
+        <button class="compare-btn" id="spec-orig" onclick="switchSpectrum('original')">ORIGINAL</button>
+        <button class="compare-btn active-filt" id="spec-filt" onclick="switchSpectrum('filtered')">FILTRAT</button>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" id="tab-spectrum" onclick="showTab('spectrum')">SPECTRU</div>
+      <div class="tab" id="tab-wave" onclick="showTab('wave')">WAVEFORM</div>
+    </div>
+
+    <div id="view-spectrum">
+      <canvas id="spectrum-canvas"></canvas>
+      <div style="display:flex; justify-content:space-between; margin-top:6px; font-family:var(--mono); font-size:10px; color:var(--muted);">
+        <span>20Hz</span><span>60Hz</span><span>200Hz</span><span>400Hz▲</span><span>1kHz</span><span>4kHz</span><span>10kHz</span><span>20kHz</span>
+      </div>
+    </div>
+
+    <div id="view-wave" style="display:none;">
+      <canvas id="wave-canvas"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+const API = '';
+let currentFile = null;
+let spectrumData = { bands: [], waveform: [] };
+let currentSpecSource = 'filtered';
+let audioCtx = null;
+let audioSource = 'filtered';
+let animFrame = null;
+
+// ─────────────────────────────────────────────
+// FILE UPLOAD
+// ─────────────────────────────────────────────
+const dropZone  = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.wav')) handleFile(f);
+  else logMsg('Doar fișiere .wav sunt acceptate.', 'err');
+});
+
+function handleFile(f) {
+  currentFile = f;
+  const sizeMB = (f.size / (1024*1024)).toFixed(1);
+  document.getElementById('file-name').textContent = '→ ' + f.name + ' (' + sizeMB + ' MB)';
+  document.getElementById('run-btn').disabled = false;
+  logMsg(`Fișier selectat: ${f.name} (${sizeMB} MB)`, 'info');
+  if (f.size > 10 * 1024 * 1024) {
+    logMsg(`WARN: Fișier mare (${sizeMB} MB). FIR NEON va dura ~${Math.round(f.size/1024/1024*0.55)}s pe Pi Zero 2W.`, 'err');
+    logMsg(`Asigură-te că main.cpp are FAST_ONLY=true și PIPELINE_TIMEOUT=600 în server.py.`, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────
+// RUN PIPELINE
+// ─────────────────────────────────────────────
+document.getElementById('run-btn').addEventListener('click', async () => {
+  if (!currentFile) return;
+
+  setStatus('running', 'PROCESARE...');
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('run-icon').textContent = '⏳';
+  logMsg('Uploading fișier...', 'info');
+
+  const fd = new FormData();
+  fd.append('file', currentFile);
+
+  try {
+    const upRes = await fetch('/upload', { method: 'POST', body: fd });
+    const upJson = await upRes.json();
+    if (!upJson.success) throw new Error(upJson.error || 'Upload eșuat');
+    logMsg('Upload OK: ' + upJson.message, 'ok');
+    // Populează stat-urile din metadatele WAV
+    if (upJson.info) {
+      const i = upJson.info;
+      document.getElementById('stat-sr').textContent  = i.sample_rate ? i.sample_rate.toLocaleString() + ' Hz' : '—';
+      document.getElementById('stat-dur').textContent = i.duration_s  ? i.duration_s + ' s' : '—';
+    }
+  } catch (e) {
+    logMsg('Upload error: ' + e.message, 'err');
+    resetRunBtn(); setStatus('err', 'EROARE'); return;
+  }
+
+  logMsg('Pornesc pipeline C++...', 'info');
+  try {
+    const res = await fetch('/run-pipeline', { method: 'POST' });
+    const json = await res.json();
+    renderLog(json.log);
+    parseStats(json.log);
+
+    if (json.success) {
+      setStatus('ok', 'GATA');
+      logMsg('Pipeline finalizat.', 'ok');
+      document.getElementById('refresh-btn').disabled = false;
+      await loadSpectrumData(currentSpecSource);
+      showPlayer();
+    } else {
+      setStatus('err', 'EROARE');
+      logMsg('Pipeline a returnat eroare.', 'err');
+    }
+  } catch (e) {
+    logMsg('Fetch error: ' + e.message, 'err');
+    setStatus('err', 'EROARE');
+  }
+
+  resetRunBtn();
+});
+
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+  await loadSpectrumData(currentSpecSource);
+  logMsg('Date actualizate.', 'ok');
+});
+
+function resetRunBtn() {
+  document.getElementById('run-btn').disabled = false;
+  document.getElementById('run-icon').textContent = '▶';
+}
+
+// ─────────────────────────────────────────────
+// SPECTRUM DATA
+// ─────────────────────────────────────────────
+async function loadSpectrumData(source) {
+  try {
+    const r = await fetch('/spectrum-data?file=' + source);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    spectrumData = d;
+    drawSpectrum(d.bands);
+    drawWaveform(d.waveform);
+    logMsg(`Spectru încărcat (${source}), ${d.sample_count} eșantioane.`, 'info');
+  } catch (e) {
+    logMsg('Eroare spectru: ' + e.message, 'err');
+  }
+}
+
+function switchSpectrum(src) {
+  currentSpecSource = src;
+  document.getElementById('spec-orig').className = 'compare-btn' + (src === 'original' ? ' active-orig' : '');
+  document.getElementById('spec-filt').className = 'compare-btn' + (src === 'filtered' ? ' active-filt' : '');
+  loadSpectrumData(src);
+}
+
+// ─────────────────────────────────────────────
+// CANVAS: SPECTRUM BARS
+// ─────────────────────────────────────────────
+function drawSpectrum(bands) {
+  const canvas = document.getElementById('spectrum-canvas');
+  const W = canvas.offsetWidth || 600;
+  const H = 200;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(0,220,180,0.07)';
+  ctx.lineWidth = 1;
+  for (let y = 0; y <= H; y += H/4) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  if (!bands || bands.length === 0) {
+    ctx.fillStyle = 'rgba(90,112,128,0.4)';
+    ctx.font = '12px Share Tech Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('— no data —', W/2, H/2);
+    return;
+  }
+
+  const n = bands.length;
+  const gap = 2;
+  const barW = (W - gap * (n + 1)) / n;
+
+  // Marcaj 400 Hz — cutoff LPF
+  // 400 Hz este banda b ≈ n * log(400/20) / log(22050/20) ≈ banda ~22 din 64
+  const cutoffBand = Math.round(n * Math.log(400/20) / Math.log(22050/20));
+  const cutoffX = gap + cutoffBand * (barW + gap);
+  ctx.strokeStyle = 'rgba(255,107,53,0.5)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath(); ctx.moveTo(cutoffX, 0); ctx.lineTo(cutoffX, H - 16); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,107,53,0.7)';
+  ctx.font = '9px Share Tech Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText('400Hz', cutoffX + 3, 10);
+
+  bands.forEach((mag, i) => {
+    const x = gap + i * (barW + gap);
+    const barH = Math.max(2, mag * (H - 20));
+    const y = H - 20 - barH;
+
+    // Benzi sub cutoff = teal (filtrate trec), deasupra = albastru atenuat
+    const aboveCutoff = i > cutoffBand;
+    const grad = ctx.createLinearGradient(0, H, 0, y);
+    if (aboveCutoff) {
+      // Deasupra 400 Hz — ar trebui să fie aproape zero după LPF
+      grad.addColorStop(0, 'rgba(0,80,120,0.5)');
+      grad.addColorStop(1, 'rgba(0,120,180,0.4)');
+    } else if (currentSpecSource === 'filtered') {
+      grad.addColorStop(0, 'rgba(0,220,180,0.95)');
+      grad.addColorStop(0.5, 'rgba(0,200,220,0.75)');
+      grad.addColorStop(1, 'rgba(160,255,255,0.95)');
+    } else {
+      grad.addColorStop(0, 'rgba(0,136,255,0.9)');
+      grad.addColorStop(0.5, 'rgba(60,100,255,0.7)');
+      grad.addColorStop(1, 'rgba(180,200,255,0.95)');
+    }
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, y, barW, barH);
+
+    // Top cap
+    ctx.fillStyle = aboveCutoff ? 'rgba(0,140,200,0.6)' :
+                    (currentSpecSource === 'filtered' ? 'rgba(160,255,240,0.9)' : 'rgba(180,210,255,0.9)');
+    ctx.fillRect(x, y, barW, 2);
+  });
+
+  // Legendă dB scale
+  ctx.fillStyle = 'rgba(90,112,128,0.7)';
+  ctx.font = '9px Share Tech Mono';
+  ctx.textAlign = 'right';
+  ctx.fillText('0 dB',  W - 2, 14);
+  ctx.fillText('-20',   W - 2, H/4 + 4);
+  ctx.fillText('-40',   W - 2, H/2 + 4);
+  ctx.fillText('-80',   W - 2, H - 22);
+}
+
+// ─────────────────────────────────────────────
+// CANVAS: WAVEFORM
+// ─────────────────────────────────────────────
+function drawWaveform(wave) {
+  const canvas = document.getElementById('wave-canvas');
+  const W = canvas.offsetWidth || 600;
+  const H = 120;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  if (!wave || wave.length === 0) return;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(0,220,180,0.07)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, H/2); ctx.lineTo(W, H/2); ctx.stroke();
+
+  // Waveform path
+  ctx.beginPath();
+  const step = W / wave.length;
+  wave.forEach((s, i) => {
+    const x = i * step;
+    const y = H/2 - s * (H/2 - 6);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+
+  ctx.strokeStyle = currentSpecSource === 'filtered' ? 'rgba(0,220,180,0.8)' : 'rgba(0,136,255,0.8)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Fill under
+  ctx.lineTo(W, H/2); ctx.lineTo(0, H/2); ctx.closePath();
+  const fillGrad = ctx.createLinearGradient(0, 0, 0, H);
+  if (currentSpecSource === 'filtered') {
+    fillGrad.addColorStop(0, 'rgba(0,220,180,0.15)');
+    fillGrad.addColorStop(1, 'rgba(0,220,180,0.01)');
+  } else {
+    fillGrad.addColorStop(0, 'rgba(0,136,255,0.15)');
+    fillGrad.addColorStop(1, 'rgba(0,136,255,0.01)');
+  }
+  ctx.fillStyle = fillGrad;
+  ctx.fill();
+}
+
+// ─────────────────────────────────────────────
+// TABS
+// ─────────────────────────────────────────────
+function showTab(name) {
+  document.getElementById('view-spectrum').style.display = name === 'spectrum' ? '' : 'none';
+  document.getElementById('view-wave').style.display     = name === 'wave'     ? '' : 'none';
+  document.getElementById('tab-spectrum').className = 'tab' + (name === 'spectrum' ? ' active' : '');
+  document.getElementById('tab-wave').className     = 'tab' + (name === 'wave'     ? ' active' : '');
+}
+
+// ─────────────────────────────────────────────
+// AUDIO PLAYER
+// ─────────────────────────────────────────────
+const audioEl = document.getElementById('audio-el');
+
+function showPlayer() {
+  document.getElementById('player-section').style.display = '';
+  switchAudio('filtered');
+}
+
+function switchAudio(src) {
+  audioSource = src;
+  const wasPlaying = !audioEl.paused;
+  const t = audioEl.currentTime;
+
+  audioEl.src = '/audio?file=' + src + '&t=' + Date.now();
+  audioEl.load();
+
+  document.getElementById('btn-orig').className = 'compare-btn' + (src === 'original' ? ' active-orig' : '');
+  document.getElementById('btn-filt').className = 'compare-btn' + (src === 'filtered' ? ' active-filt' : '');
+
+  audioEl.addEventListener('loadedmetadata', () => {
+    audioEl.currentTime = Math.min(t, audioEl.duration);
+    if (wasPlaying) audioEl.play();
+    updateTimeLabel();
+  }, { once: true });
+}
+
+function togglePlay() {
+  const btn = document.getElementById('play-btn');
+  if (audioEl.paused) {
+    audioEl.play();
+    btn.textContent = '⏸';
+  } else {
+    audioEl.pause();
+    btn.textContent = '▶';
+  }
+}
+
+function seekTo(e) {
+  const rect = document.getElementById('seek-track').getBoundingClientRect();
+  const pct = (e.clientX - rect.left) / rect.width;
+  if (audioEl.duration) {
+    audioEl.currentTime = pct * audioEl.duration;
+  }
+}
+
+function setVolume(v) {
+  audioEl.volume = v;
+}
+
+audioEl.addEventListener('timeupdate', updateTimeLabel);
+audioEl.addEventListener('ended', () => {
+  document.getElementById('play-btn').textContent = '▶';
+});
+
+function updateTimeLabel() {
+  const cur = audioEl.currentTime || 0;
+  const dur = audioEl.duration || 0;
+  const pct = dur > 0 ? (cur / dur * 100).toFixed(1) : 0;
+  document.getElementById('seek-fill').style.width = pct + '%';
+  document.getElementById('seek-thumb').style.left = pct + '%';
+  document.getElementById('time-label').textContent = fmt(cur) + ' / ' + fmt(dur);
+}
+
+function fmt(s) {
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60).toString().padStart(2, '0');
+  return m + ':' + ss;
+}
+
+// ─────────────────────────────────────────────
+// STATS PARSING
+// ─────────────────────────────────────────────
+function parseStats(log) {
+  const firMatch   = log.match(/TIMP EXECUTIE FIR NAIV:\s*([\d.]+)/);
+  const neonMatch  = log.match(/TIMP EXECUTIE FIR NEON:\s*([\d.]+)/);
+  const speedMatch = log.match(/ACCELERARE.*?:\s*([\d.]+)/);
+  const srMatch    = log.match(/sample_rate[=:\s]+([\d]+)/i);
+
+  if (firMatch)   document.getElementById('stat-fir').textContent     = parseFloat(firMatch[1]).toFixed(1) + ' ms';
+  if (neonMatch)  document.getElementById('stat-neon').textContent    = parseFloat(neonMatch[1]).toFixed(1) + ' ms';
+  if (speedMatch) document.getElementById('stat-speedup').textContent = parseFloat(speedMatch[1]).toFixed(2) + 'x';
+  if (srMatch)    document.getElementById('stat-sr').textContent      = parseInt(srMatch[1]).toLocaleString() + ' Hz';
+}
+
+// ─────────────────────────────────────────────
+// LOG
+// ─────────────────────────────────────────────
+function logMsg(msg, type = 'info') {
+  const box = document.getElementById('log-box');
+  const span = document.createElement('span');
+  span.className = 'log-' + type;
+  span.textContent = '> ' + msg + '\n';
+  // Remove cursor, append, re-add cursor
+  const cursor = box.querySelector('.log-cursor');
+  if (cursor) cursor.remove();
+  box.appendChild(span);
+  const cur = document.createElement('span');
+  cur.className = 'log-cursor';
+  box.appendChild(cur);
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderLog(raw) {
+  if (!raw) return;
+  raw.split('\n').forEach(line => {
+    if (!line.trim()) return;
+    let type = 'info';
+    if (line.includes('[INFO]') || line.includes('Fisier') || line.includes('salv'))  type = 'ok';
+    if (line.includes('EROARE') || line.includes('ERR') || line.includes('error'))    type = 'err';
+    if (line.includes('TIMP') || line.includes('ACCELERARE'))                         type = 'ok';
+    logMsg(line, type);
+  });
+}
+
+function clearLog() {
+  document.getElementById('log-box').innerHTML = '<span class="log-info">// Console cleared.\n</span><span class="log-cursor"></span>';
+}
+
+// ─────────────────────────────────────────────
+// STATUS
+// ─────────────────────────────────────────────
+function setStatus(state, text) {
+  const el = document.getElementById('status-pill');
+  el.className = 'status-pill ' + state;
+  el.textContent = text;
+}
+
+// ─────────────────────────────────────────────
+// RESIZE CANVASES
+// ─────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  if (spectrumData.bands.length) {
+    drawSpectrum(spectrumData.bands);
+    drawWaveform(spectrumData.waveform);
+  }
+});
+</script>
+
+</body>
+</html>

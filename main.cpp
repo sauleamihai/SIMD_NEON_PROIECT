@@ -211,53 +211,39 @@ void fft_neon(std::vector<Complex>& a) {
 }
 
 // Interfata vizuala in terminal
-void afiseaza_spectru_ascii(const std::vector<Complex>& date_fft, int sample_rate, const std::string& titlu) {
-    int n = date_fft.size() / 2; 
+void afiseaza_spectru_ascii(const std::vector<Complex>& date_fft, int sample_rate) {
+    int n = date_fft.size() / 2; // Afisam doar frecventele utile (pana la Nyquist)
     const int N_BENZI = 8;
     float magnitudini_benzi[N_BENZI] = {0};
     int samples_per_band = n / N_BENZI;
 
-    std::cout << "\n=== " << titlu << " ===\n";
+    std::cout << "\n--- ANALIZOR DE SPECTRU (ASCII View) ---\n";
 
-    // 1. Calculam magnitudinea pe fiecare banda si gasim maximul pentru Auto-Scalare
-    float max_mag = 0.0001f;
     for (int b = 0; b < N_BENZI; b++) {
         float suma = 0;
         for (int i = 0; i < samples_per_band; i++) {
             Complex c = date_fft[b * samples_per_band + i];
+            // Calculam magnitudinea: sqrt(real^2 + imag^2)
             suma += std::sqrt(c.real() * c.real() + c.imag() * c.imag());
         }
-        magnitudini_benzi[b] = suma / samples_per_band;
-        if (magnitudini_benzi[b] > max_mag) {
-            max_mag = magnitudini_benzi[b];
-        }
-    }
-
-    // 2. Etichete detaliate pentru frecvente
-    const std::string etichete[N_BENZI] = {
-        "SUB-BASS (20-60Hz)  ",
-        "BASS     (60-250Hz) ",
-        "LOW-MID  (250-500Hz)",
-        "MID      (500-2kHz) ",
-        "UP-MID   (2k-4kHz)  ",
-        "PRESENCE (4k-6kHz)  ",
-        "BRILLIANCE(6k-10kHz)",
-        "HIGH     (10k-20kHz)"
-    };
-
-    // 3. Desenam graficul proportional cu frecventa maxima gasita
-    for (int b = 0; b < N_BENZI; b++) {
-        // Mapam valoarea raportata la maxim, pe o lungime de 40 de caractere
-        int lungime_bara = static_cast<int>((magnitudini_benzi[b] / max_mag) * 40.0f);
         
-        std::cout << etichete[b] << " |";
+        // Media pe bandă + un factor de scalare (mareste 20.0f dacă barele sunt prea mici)
+        magnitudini_benzi[b] = (suma / samples_per_band) * 20.0f; 
+
+        int lungime_bara = static_cast<int>(magnitudini_benzi[b]);
+        if (lungime_bara > 40) lungime_bara = 40; // Limităm vizual la 40 de caractere
+
+        std::string eticheta;
+        if (b == 0) eticheta = "SUB-BASS";
+        else if (b == 1) eticheta = "BASS    ";
+        else if (b < 5) eticheta = "MID     ";
+        else eticheta = "HIGH    ";
+
+        std::cout << eticheta << " |";
         for (int i = 0; i < lungime_bara; i++) std::cout << "█";
-        
-        // Un mic artificiu vizual: adaugam un pointer la capăt
-        if (lungime_bara > 0) std::cout << "▌"; 
         std::cout << "\n";
     }
-    std::cout << "--------------------------------------------------\n";
+    std::cout << "----------------------------------------\n";
 }
 
 void fir_neon(const std::vector<float>& intrare, const std::vector<float>& coef, std::vector<float>& iesire) {
@@ -295,114 +281,127 @@ void fir_neon(const std::vector<float>& intrare, const std::vector<float>& coef,
 // FUNCȚIA PRINCIPALĂ
 // ==========================================
 int main() {
+    // ── CONFIG ─────────────────────────────────────────────────────
+    // FAST_ONLY = true  → sare FIR naiv (recomandat pentru fisiere > 5 MB)
+    // FAST_ONLY = false → ruleaza ambele variante si afiseaza speedup-ul real
+    //                     (foloseste un WAV scurt ~10s pentru benchmark corect)
+    const bool FAST_ONLY = true;
+
+    // Prag automat: daca fisierul depaseste aceasta limita si FAST_ONLY=false,
+    // FIR naiv este sarit oricum cu un avertisment.
+    const int NAIVE_SAMPLE_LIMIT = 250000;
+    // ───────────────────────────────────────────────────────────────
+
     std::cout << "=== Pipeline DSP Audio (C++ vs ARM NEON) ===" << std::endl;
 
-    std::string fisier_intrare = "test_audio.wav"; 
-    std::string fisier_iesire = "audio_filtrat.wav";
+    std::string fisier_intrare = "test_audio.wav";
+    std::string fisier_iesire  = "audio_filtrat.wav";
     WavHeader header_audio;
 
-    std::cout << "\n[1] Incarcare fisier..." << std::endl;
+    std::cout << "\n[1] Incarcare fisier..." << std::flush;
     std::vector<float> semnal_original = citeste_wav(fisier_intrare, header_audio);
-    if (semnal_original.empty()) return 1;
+    if (semnal_original.empty()) {
+        std::cerr << "\n[ERR] Fisier gol sau format invalid!" << std::endl;
+        return 1;
+    }
 
-    // Buffer comun pentru rezultate (Optimizare Memorie RAM)
+    int   n_esantioane = static_cast<int>(semnal_original.size());
+    float durata_s     = static_cast<float>(n_esantioane) / header_audio.sample_rate;
+    std::cout << " OK" << std::endl;
+    std::cout << "    -> Esantioane:  " << n_esantioane << "\n"
+              << "    -> Durata:      " << durata_s     << " s\n"
+              << "    -> Sample rate: " << header_audio.sample_rate << " Hz\n"
+              << "    -> Canale:      " << header_audio.num_channels << std::endl;
+
     std::vector<float> buffer_iesire(semnal_original.size(), 0.0f);
 
     // ---------------------------------------------------------
-    // GENERARE COEFICIENȚI EGALIZATOR (Windowed-Sinc)
+    // GENERARE COEFICIENȚI FIR (Windowed-Sinc + Hamming)
     // ---------------------------------------------------------
-    float frecventa_taiere = 400.0f; // Taiem tot ce e peste 400 Hz (pastram doar basul)
-    int numar_coeficienti = 101;     // Filtru precis, de ordinul 100
-    float sample_rate = header_audio.sample_rate;
+    float frecventa_taiere = 400.0f;
+    int   numar_coeficienti = 101;
+    float sample_rate = static_cast<float>(header_audio.sample_rate);
 
-    std::cout << "\n[2] Generez filtru Trece-Jos profesional..." << std::endl;
-    std::cout << "    -> Frecventa taiere: " << frecventa_taiere << " Hz" << std::endl;
-    std::cout << "    -> Numar coeficienti: " << numar_coeficienti << std::endl;
-
-    std::vector<float> coeficienti_fir = genereaza_filtru_trece_jos(frecventa_taiere, sample_rate, numar_coeficienti);
-
-    // ---------------------------------------------------------
-    // RULAM VARIANTA NAIVA
-    // ---------------------------------------------------------
-    std::cout << "\n[3.A] Procesare FIR NAIV pe " << semnal_original.size() << " esantioane..." << std::endl;
-    auto start_fir = std::chrono::high_resolution_clock::now();
-    
-    fir_naiv(semnal_original, coeficienti_fir, buffer_iesire);
-    
-    auto stop_fir = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> durata_fir = stop_fir - start_fir;
-    std::cout << "-> TIMP EXECUTIE FIR NAIV: " << durata_fir.count() << " ms." << std::endl;
+    std::cout << "\n[2] Generez filtru Trece-Jos (Windowed-Sinc)..." << std::flush;
+    std::vector<float> coeficienti_fir = genereaza_filtru_trece_jos(
+        frecventa_taiere, sample_rate, numar_coeficienti);
+    std::cout << " OK" << std::endl;
+    std::cout << "    -> Frecventa taiere:  " << frecventa_taiere   << " Hz\n"
+              << "    -> Numar coeficienti: " << numar_coeficienti  << std::endl;
 
     // ---------------------------------------------------------
-    // RULAM VARIANTA NEON
+    // FIR NAIV — opțional, lent pe fisiere mari
     // ---------------------------------------------------------
-    std::cout << "\n[3.B] Procesare FIR OPTIMIZAT CU NEON..." << std::endl;
-    auto start_neon = std::chrono::high_resolution_clock::now();
-    
+    bool ruleaza_naiv = !FAST_ONLY && (n_esantioane <= NAIVE_SAMPLE_LIMIT);
+    double durata_fir_ms = 0.0;
+
+    if (ruleaza_naiv) {
+        std::cout << "\n[3.A] Procesare FIR NAIV pe "
+                  << n_esantioane << " esantioane..." << std::flush;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        fir_naiv(semnal_original, coeficienti_fir, buffer_iesire);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        durata_fir_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << " OK" << std::endl;
+        std::cout << "-> TIMP EXECUTIE FIR NAIV: " << durata_fir_ms << " ms." << std::endl;
+    } else {
+        if (FAST_ONLY) {
+            std::cout << "\n[3.A] FIR NAIV: SKIP (FAST_ONLY=true)" << std::endl;
+        } else {
+            std::cout << "\n[3.A] FIR NAIV: SKIP (fisier prea mare: "
+                      << n_esantioane << " esantioane > limita "
+                      << NAIVE_SAMPLE_LIMIT << ")" << std::endl;
+        }
+        std::cout << "-> TIMP EXECUTIE FIR NAIV: N/A" << std::endl;
+    }
+
+    // ---------------------------------------------------------
+    // FIR NEON — rulează întotdeauna, produce fișierul de ieșire
+    // ---------------------------------------------------------
+    std::cout << "\n[3.B] Procesare FIR NEON pe "
+              << n_esantioane << " esantioane..." << std::flush;
+    auto t0_neon = std::chrono::high_resolution_clock::now();
     fir_neon(semnal_original, coeficienti_fir, buffer_iesire);
-    
-    auto stop_neon = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> durata_neon = stop_neon - start_neon;
-    std::cout << "-> TIMP EXECUTIE FIR NEON: " << durata_neon.count() << " ms." << std::endl;
-    
-    double speedup = durata_fir.count() / durata_neon.count();
-    std::cout << "-> ACCELERARE (SPEEDUP): " << speedup << "x mai rapid!" << std::endl;
+    auto t1_neon = std::chrono::high_resolution_clock::now();
+    double durata_neon_ms = std::chrono::duration<double, std::milli>(t1_neon - t0_neon).count();
+    std::cout << " OK" << std::endl;
+    std::cout << "-> TIMP EXECUTIE FIR NEON: " << durata_neon_ms << " ms." << std::endl;
 
-    // ---------------------------------------------------------
-    // FFT SI SALVARE
-    // ---------------------------------------------------------
-
-    std::cout << "\n[4.A] Analiza FFT (INAINTE de filtrare) pe un cadru de 1024 esantioane..." << std::endl;
-    int dimensiune_cadru = 1024;
-    
-    // Sarim la jumatatea melodiei
-    int start_idx = semnal_original.size() / 2;
-    
-    std::vector<Complex> cadru_fft_inainte(dimensiune_cadru, Complex(0.0f, 0.0f));
-    int limita_inainte = std::min(dimensiune_cadru, (int)semnal_original.size() - start_idx);
-    for (int i = 0; i < limita_inainte; i++) {
-        cadru_fft_inainte[i] = Complex(semnal_original[start_idx + i], 0.0f);
+    if (ruleaza_naiv && durata_neon_ms > 0.0) {
+        double speedup = durata_fir_ms / durata_neon_ms;
+        std::cout << "-> ACCELERARE (SPEEDUP): " << speedup << "x mai rapid!" << std::endl;
+    } else {
+        std::cout << "-> ACCELERARE (SPEEDUP): N/A (FIR naiv sarit)" << std::endl;
     }
 
-    fft_neon(cadru_fft_inainte); 
-    afiseaza_spectru_ascii(cadru_fft_inainte, header_audio.sample_rate, "SPECTRU ORIGINAL (Inainte de Filtrare)");
-
-    std::cout << "\n[4.B] Analiza FFT (DUPA filtrare) pe acelasi cadru..." << std::endl;
-    
-    std::vector<Complex> cadru_fft_dupa(dimensiune_cadru, Complex(0.0f, 0.0f));
-    int limita_dupa = std::min(dimensiune_cadru, (int)buffer_iesire.size() - start_idx);
-    for (int i = 0; i < limita_dupa; i++) {
-        cadru_fft_dupa[i] = Complex(buffer_iesire[start_idx + i], 0.0f);
-    }
-
-    fft_neon(cadru_fft_dupa); 
-    afiseaza_spectru_ascii(cadru_fft_dupa, header_audio.sample_rate, "SPECTRU FILTRAT (Dupa FIR NEON)");
-
-    std::cout << "\n[5] Salvare fisier modificat..." << std::endl;
-    scrie_wav(fisier_iesire, buffer_iesire, header_audio);
-
-    std::cout << "\n=== Pipeline Finalizat ===" << std::endl;
-    return 0;
-
-    /*std::cout << "\n[4] Analiza FFT (cadru 1024 esantioane)..." << std::endl;
+    // ---------------------------------------------------------
+    // FFT + SPECTRU ASCII
+    // ---------------------------------------------------------
+    std::cout << "\n[4] Analiza FFT iterativ (cadru 1024 esantioane)..." << std::flush;
     int dimensiune_cadru = 1024;
     std::vector<Complex> cadru_fft(dimensiune_cadru, Complex(0.0f, 0.0f));
-    
-    int limita = std::min(dimensiune_cadru, (int)buffer_iesire.size());
+
+    int limita = std::min(dimensiune_cadru, static_cast<int>(buffer_iesire.size()));
     for (int i = 0; i < limita; i++) {
         cadru_fft[i] = Complex(buffer_iesire[i], 0.0f);
     }
 
-    auto start_fft = std::chrono::high_resolution_clock::now();
-    fft_naiv(cadru_fft);
-    auto stop_fft = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> durata_fft = stop_fft - start_fft;
-    std::cout << "-> TIMP EXECUTIE FFT NAIV: " << durata_fft.count() << " ms." << std::endl;
+    auto t0_fft = std::chrono::high_resolution_clock::now();
+    fft_neon(cadru_fft);
+    auto t1_fft = std::chrono::high_resolution_clock::now();
+    double durata_fft_ms = std::chrono::duration<double, std::milli>(t1_fft - t0_fft).count();
+    std::cout << " OK" << std::endl;
+    std::cout << "-> TIMP EXECUTIE FFT (Iterativ): " << durata_fft_ms << " ms." << std::endl;
 
-    std::cout << "\n[5] Salvare fisier modificat..." << std::endl;
+    afiseaza_spectru_ascii(cadru_fft, header_audio.sample_rate);
+
+    // ---------------------------------------------------------
+    // SALVARE
+    // ---------------------------------------------------------
+    std::cout << "\n[5] Salvare fisier modificat..." << std::flush;
     scrie_wav(fisier_iesire, buffer_iesire, header_audio);
+    // scrie_wav afișează deja "[INFO] Fisier salvat" intern
 
     std::cout << "\n=== Pipeline Finalizat ===" << std::endl;
     return 0;
-    */
 }
