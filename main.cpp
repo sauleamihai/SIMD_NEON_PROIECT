@@ -1,4 +1,4 @@
-/**
+/*
  * ============================================================
  *  DSP Audio Equalizer — ARM NEON Optimized
  *  Target: Raspberry Pi Zero 2W (Cortex-A53, ARMv8 AArch32/64)
@@ -1096,63 +1096,137 @@ bool process_streaming(const std::string& in_path,
     std::cout << "[STREAM] " << total_frames << " frames, "
               << CH << "ch, chunk=" << CHUNK_FRAMES << "\n";
 
-    // Working buffers — allocated once
+    // Working buffers — allocated once outside the loop
     std::vector<int16_t> raw(CHUNK_FRAMES * CH);
     std::vector<float>   chL(CHUNK_FRAMES), chR(CHUNK_FRAMES);
     std::vector<int16_t> out_raw(CHUNK_FRAMES * CH);
+
+    // Precompute NEON constants used in every chunk
+    const float32x4_t vSCALE_IN  = vdupq_n_f32(1.0f / 32768.0f);  // int16→float
+    const float32x4_t vSCALE_OUT = vdupq_n_f32(32767.0f);          // float→int16
+    const float32x4_t vCLAMP_HI  = vdupq_n_f32( 1.0f);
+    const float32x4_t vCLAMP_LO  = vdupq_n_f32(-1.0f);
 
     int frames_done = 0;
     while (frames_done < total_frames) {
         int frames_now = std::min(CHUNK_FRAMES, total_frames - frames_done);
 
-        // Read
+        // Read raw int16 from disk
         fin.read(reinterpret_cast<char*>(raw.data()),
                  frames_now * CH * bytes_per_sample);
 
         if (CH == 1) {
-            // Mono: convert int16→float, process, convert back
-            for (int i = 0; i < frames_now; ++i)
-                chL[i] = raw[i] / 32768.0f;
+            // ── MONO int16 → float ──────────────────────────
+            // NEON: 8 samples per iteration
+            //   vld1_s16     → int16x8  (8 × int16)
+            //   vmovl_s16    → int32x4  (widen low 4)
+            //   vget_high_s16→ vmovl    (widen high 4)
+            //   vcvtq_f32_s32→ float32x4
+            //   vmulq_f32    → ÷ 32768
+            int i = 0;
+            for (; i <= frames_now - 8; i += 8) {
+                int16x8_t s16 = vld1q_s16(raw.data() + i);
 
+                int32x4_t lo32 = vmovl_s16(vget_low_s16(s16));
+                int32x4_t hi32 = vmovl_s16(vget_high_s16(s16));
+
+                float32x4_t flo = vmulq_f32(vcvtq_f32_s32(lo32), vSCALE_IN);
+                float32x4_t fhi = vmulq_f32(vcvtq_f32_s32(hi32), vSCALE_IN);
+
+                vst1q_f32(chL.data() + i,     flo);
+                vst1q_f32(chL.data() + i + 4, fhi);
+            }
+            // Scalar tail (< 8 remaining)
+            for (; i < frames_now; ++i)
+                chL[i] = raw[i] * (1.0f / 32768.0f);
+
+            // Process EQ
             eq.process_block_mono(chL.data(), chL.data(), frames_now, 0);
 
-            for (int i = 0; i < frames_now; ++i) {
-                float v = std::max(-1.0f, std::min(1.0f, chL[i]));
-                out_raw[i] = static_cast<int16_t>(v * 32767.0f);
+            // ── MONO float → int16 ──────────────────────────
+            // NEON: 8 samples per iteration
+            //   vmaxq / vminq → clamp to [-1, 1]
+            //   vmulq_f32     → × 32767
+            //   vcvtq_s32_f32 → int32
+            //   vmovn_s32     → int16 (narrow)
+            //   vcombine_s16  → int16x8
+            //   vst1q_s16     → store 8 × int16
+            i = 0;
+            for (; i <= frames_now - 8; i += 8) {
+                float32x4_t f0 = vld1q_f32(chL.data() + i);
+                float32x4_t f1 = vld1q_f32(chL.data() + i + 4);
+
+                f0 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, f0)), vSCALE_OUT);
+                f1 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, f1)), vSCALE_OUT);
+
+                int16x4_t s0 = vmovn_s32(vcvtq_s32_f32(f0));
+                int16x4_t s1 = vmovn_s32(vcvtq_s32_f32(f1));
+
+                vst1q_s16(out_raw.data() + i, vcombine_s16(s0, s1));
             }
-        } else {
-            // Stereo: deinterleave int16→float per channel
-            for (int i = 0; i < frames_now; ++i) {
-                chL[i] = raw[i * 2    ] / 32768.0f;
-                chR[i] = raw[i * 2 + 1] / 32768.0f;
+            for (; i < frames_now; ++i) {
+                float v = std::max(-1.f, std::min(1.f, chL[i]));
+                out_raw[i] = static_cast<int16_t>(v * 32767.f);
             }
 
+        } else {
+            // ── STEREO int16 → float (deinterleave) ─────────
+            // NEON: vld2q_s16 loads 8 frames (16 int16) and
+            // automatically deinterleaves into L and R vectors.
+            // Then widen + convert each half as in mono path.
+            int i = 0;
+            for (; i <= frames_now - 8; i += 8) {
+                // vld2q_s16: loads [L0 R0 L1 R1 ... L7 R7]
+                // → val[0] = [L0 L1 L2 L3 L4 L5 L6 L7]
+                // → val[1] = [R0 R1 R2 R3 R4 R5 R6 R7]
+                int16x8x2_t s16 = vld2q_s16(raw.data() + i * 2);
+
+                // Left channel
+                float32x4_t Llo = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16.val[0]))),  vSCALE_IN);
+                float32x4_t Lhi = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16.val[0]))), vSCALE_IN);
+                vst1q_f32(chL.data() + i,     Llo);
+                vst1q_f32(chL.data() + i + 4, Lhi);
+
+                // Right channel
+                float32x4_t Rlo = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16.val[1]))),  vSCALE_IN);
+                float32x4_t Rhi = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16.val[1]))), vSCALE_IN);
+                vst1q_f32(chR.data() + i,     Rlo);
+                vst1q_f32(chR.data() + i + 4, Rhi);
+            }
+            // Scalar tail
+            for (; i < frames_now; ++i) {
+                chL[i] = raw[i * 2    ] * (1.0f / 32768.0f);
+                chR[i] = raw[i * 2 + 1] * (1.0f / 32768.0f);
+            }
+
+            // Process EQ — L and R independently (preserves stereo state)
             eq.process_block_mono(chL.data(), chL.data(), frames_now, 0);
             eq.process_block_mono(chR.data(), chR.data(), frames_now, 1);
 
-            // NEON interleave back to int16
-            for (int i = 0; i < frames_now - 3; i += 4) {
-                float32x4_t L4 = vld1q_f32(chL.data() + i);
-                float32x4_t R4 = vld1q_f32(chR.data() + i);
-                // Clamp
-                float32x4_t lo = vdupq_n_f32(-1.f), hi = vdupq_n_f32(1.f);
-                L4 = vmaxq_f32(lo, vminq_f32(hi, L4));
-                R4 = vmaxq_f32(lo, vminq_f32(hi, R4));
-                // Scale to int16 range
-                float32x4_t sc = vdupq_n_f32(32767.f);
-                L4 = vmulq_f32(L4, sc);
-                R4 = vmulq_f32(R4, sc);
-                // Convert to int32 then int16
-                int32x4_t Li = vcvtq_s32_f32(L4);
-                int32x4_t Ri = vcvtq_s32_f32(R4);
-                int16x4_t Ls = vmovn_s32(Li);
-                int16x4_t Rs = vmovn_s32(Ri);
-                // Interleave and store
-                int16x4x2_t interleaved = {Ls, Rs};
-                vst2_s16(out_raw.data() + i * 2, interleaved);
+            // ── STEREO float → int16 (interleave) ───────────
+            // vst2_s16: takes two int16x4_t and writes [L0 R0 L1 R1 ...]
+            // We do 8 frames per iteration using vst2q_s16 (int16x8x2_t)
+            i = 0;
+            for (; i <= frames_now - 8; i += 8) {
+                float32x4_t L0 = vld1q_f32(chL.data() + i);
+                float32x4_t L1 = vld1q_f32(chL.data() + i + 4);
+                float32x4_t R0 = vld1q_f32(chR.data() + i);
+                float32x4_t R1 = vld1q_f32(chR.data() + i + 4);
+
+                L0 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, L0)), vSCALE_OUT);
+                L1 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, L1)), vSCALE_OUT);
+                R0 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, R0)), vSCALE_OUT);
+                R1 = vmulq_f32(vmaxq_f32(vCLAMP_LO, vminq_f32(vCLAMP_HI, R1)), vSCALE_OUT);
+
+                int16x8x2_t out16;
+                out16.val[0] = vcombine_s16(vmovn_s32(vcvtq_s32_f32(L0)),
+                                            vmovn_s32(vcvtq_s32_f32(L1)));
+                out16.val[1] = vcombine_s16(vmovn_s32(vcvtq_s32_f32(R0)),
+                                            vmovn_s32(vcvtq_s32_f32(R1)));
+                vst2q_s16(out_raw.data() + i * 2, out16);
             }
             // Scalar tail
-            for (int i = (frames_now / 4) * 4; i < frames_now; ++i) {
+            for (; i < frames_now; ++i) {
                 float L = std::max(-1.f, std::min(1.f, chL[i]));
                 float R = std::max(-1.f, std::min(1.f, chR[i]));
                 out_raw[i * 2    ] = static_cast<int16_t>(L * 32767.f);
