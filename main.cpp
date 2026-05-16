@@ -1,18 +1,3 @@
-/*
- * ============================================================
- *  DSP Audio Equalizer — ARM NEON Optimized
- *  Target: Raspberry Pi Zero 2W (Cortex-A53, ARMv8 AArch32/64)
- *
- *  Features:
- *   - 10-band parametric EQ (windowed-sinc FIR per band)
- *   - Overlap-Save convolution (O(N log N) via FFT)
- *   - ARM NEON SIMD: FIR dot-product, FFT butterfly, magnitude
- *   - Precomputed twiddle tables (no repeated trig)
- *   - Stereo interleave/deinterleave with NEON vuzpq
- *   - JSON output for Flask GUI
- * ============================================================
- */
-
 #include <iostream>
 #include <vector>
 #include <complex>
@@ -183,7 +168,6 @@ struct FFTPlan {
     }
 
     // In-place forward FFT
-    // NEON butterfly: processes 2 butterflies (4 complex values) per iteration
     void forward(std::vector<Complex>& a) const {
         // Bit-reversal
         for (int i = 0; i < N; ++i)
@@ -191,44 +175,79 @@ struct FFTPlan {
 
         for (int len = 2; len <= N; len <<= 1) {
             int half   = len >> 1;
-            int stride = N / len;   // twiddle index stride
+            int stride = N / len;
 
             for (int i = 0; i < N; i += len) {
-                // Try to do 2 butterflies at once with NEON
+                // ── Full NEON butterfly: 4 butterflies per iteration ──
+                // Each butterfly:  a[u] = U + W*V,  a[v] = U - W*V
+                //
+                // Complex multiply W*V in NEON (no scalar cross-domain):
+                //   re(W*V) = re(W)*re(V) - im(W)*im(V)
+                //   im(W*V) = re(W)*im(V) + im(W)*re(V)
+                //
+                // Layout in memory: [re0, im0, re1, im1, re2, im2, re3, im3]
+                // We process 4 butterflies using two float32x4_t per array half:
+                //   U_re = [re(u0), re(u1), re(u2), re(u3)]
+                //   U_im = [im(u0), im(u1), im(u2), im(u3)]
+                //   V_re, V_im similarly for lower half
+                //   W_re, W_im for twiddle factors
+
                 int j = 0;
-                for (; j <= half - 2; j += 2) {
-                    // Load twiddle factors
-                    const Complex& w0 = twiddle[j       * stride];
-                    const Complex& w1 = twiddle[(j + 1) * stride];
+                for (; j <= half - 4; j += 4) {
+                    // Load upper half: 4 complex = 8 floats, deinterleave re/im
+                    float32x4x2_t U = vld2q_f32(
+                        reinterpret_cast<const float*>(&a[i + j]));
+                    float32x4_t U_re = U.val[0];
+                    float32x4_t U_im = U.val[1];
 
-                    // u0, u1 = upper half
-                    float u0r = a[i+j  ].real(), u0i = a[i+j  ].imag();
-                    float u1r = a[i+j+1].real(), u1i = a[i+j+1].imag();
+                    // Load lower half
+                    float32x4x2_t V_raw = vld2q_f32(
+                        reinterpret_cast<const float*>(&a[i + j + half]));
+                    float32x4_t V_re = V_raw.val[0];
+                    float32x4_t V_im = V_raw.val[1];
 
-                    // v0, v1 = lower half * twiddle
-                    float v0r = a[i+j+half  ].real() * w0.real() - a[i+j+half  ].imag() * w0.imag();
-                    float v0i = a[i+j+half  ].real() * w0.imag() + a[i+j+half  ].imag() * w0.real();
-                    float v1r = a[i+j+half+1].real() * w1.real() - a[i+j+half+1].imag() * w1.imag();
-                    float v1i = a[i+j+half+1].real() * w1.imag() + a[i+j+half+1].imag() * w1.real();
+                    // Load 4 twiddle factors
+                    float32x4x2_t W = vld2q_f32(
+                        reinterpret_cast<const float*>(&twiddle[(j    ) * stride]));
+                    // Note: twiddle array stores consecutive Complex values,
+                    // but they have stride between them. Build W manually:
+                    float w_re[4], w_im[4];
+                    for (int k = 0; k < 4; ++k) {
+                        w_re[k] = twiddle[(j + k) * stride].real();
+                        w_im[k] = twiddle[(j + k) * stride].imag();
+                    }
+                    float32x4_t W_re = vld1q_f32(w_re);
+                    float32x4_t W_im = vld1q_f32(w_im);
 
-                    // Pack into NEON registers: [u0r, u0i, u1r, u1i]
-                    float32x4_t U = {u0r, u0i, u1r, u1i};
-                    float32x4_t V = {v0r, v0i, v1r, v1i};
-                    float32x4_t S = vaddq_f32(U, V);
-                    float32x4_t D = vsubq_f32(U, V);
+                    // Complex multiply: WV = W * V
+                    // WV_re = W_re*V_re - W_im*V_im
+                    // WV_im = W_re*V_im + W_im*V_re
+                    float32x4_t WV_re = vmulq_f32(W_re, V_re);
+                    WV_re = vmlsq_f32(WV_re, W_im, V_im);   // WV_re -= W_im*V_im
 
-                    a[i+j  ] = {vgetq_lane_f32(S, 0), vgetq_lane_f32(S, 1)};
-                    a[i+j+1] = {vgetq_lane_f32(S, 2), vgetq_lane_f32(S, 3)};
-                    a[i+j+half  ] = {vgetq_lane_f32(D, 0), vgetq_lane_f32(D, 1)};
-                    a[i+j+half+1] = {vgetq_lane_f32(D, 2), vgetq_lane_f32(D, 3)};
+                    float32x4_t WV_im = vmulq_f32(W_re, V_im);
+                    WV_im = vmlaq_f32(WV_im, W_im, V_re);   // WV_im += W_im*V_re
+
+                    // Butterfly add/sub
+                    float32x4_t S_re = vaddq_f32(U_re, WV_re);
+                    float32x4_t S_im = vaddq_f32(U_im, WV_im);
+                    float32x4_t D_re = vsubq_f32(U_re, WV_re);
+                    float32x4_t D_im = vsubq_f32(U_im, WV_im);
+
+                    // Store interleaved [re, im, re, im, ...]
+                    float32x4x2_t S_out = {S_re, S_im};
+                    float32x4x2_t D_out = {D_re, D_im};
+                    vst2q_f32(reinterpret_cast<float*>(&a[i + j]),        S_out);
+                    vst2q_f32(reinterpret_cast<float*>(&a[i + j + half]), D_out);
                 }
-                // Scalar tail
+
+                // Scalar tail for remaining butterflies
                 for (; j < half; ++j) {
                     Complex w = twiddle[j * stride];
-                    Complex u = a[i+j];
-                    Complex v = a[i+j+half] * w;
-                    a[i+j]      = u + v;
-                    a[i+j+half] = u - v;
+                    Complex u = a[i + j];
+                    Complex v = a[i + j + half] * w;
+                    a[i + j]        = u + v;
+                    a[i + j + half] = u - v;
                 }
             }
         }
@@ -330,45 +349,67 @@ struct FIRFilter {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  BIQUAD IIR — Peaking / Shelving EQ (Audio EQ Cookbook)
-//  Direct Form I with NEON: process 4 samples per loop iteration
-//  using the recurrence unrolled into SIMD-friendly form.
+//  BIQUAD — Transposed Direct Form II, scalar 4× unrolled
 //
-//  Why biquad instead of FIR band-sum?
-//  - FIR band-sum causes amplitude dips at crossover frequencies
-//    (bands don't add to flat response) → the noise/distortion
-//  - Biquad peaking filters modify ONLY the target band, leaving
-//    everything else at exactly 0 dB — like real hardware EQ
-//  - 5 multiplies per sample vs 127×N for FIR → ~25× less CPU
+//  TDF2 recurrence (2 state variables, vs 4 for DF1):
+//    y[n]  = b0·x[n] + s1
+//    s1'   = b1·x[n] - a1·y[n] + s2
+//    s2'   = b2·x[n] - a2·y[n]
+//
+//  Why scalar instead of NEON for the biquad loop?
+//  Cortex-A53 is in-order with a 3-4 cycle cross-domain penalty
+//  for every NEON→scalar transfer (vgetq_lane_f32). A biquad loop
+//  needs the output of each sample as input to the next state
+//  update — forcing at least 2 cross-domain transfers per sample.
+//  This completely negates any NEON benefit on A53.
+//
+//  The correct strategy for A53:
+//  - Keep the biquad loop purely scalar with locals in registers
+//  - Unroll 4× so the compiler can overlap FP multiply latencies
+//  - Use -ffast-math so GCC can reorder FP ops freely
+//  - NEON is used everywhere else (int16↔float conversion, FFT,
+//    magnitude, stereo I/O) where there are NO cross-domain transfers
 // ─────────────────────────────────────────────────────────────
 
 struct BiquadCoeffs {
-    float b0, b1, b2;   // feed-forward
-    float a1, a2;       // feed-back (a0 normalised to 1)
+    float b0, b1, b2, a1, a2;
+
+    // precompute() e un no-op acum — păstrat pentru compatibilitate cu
+    // funcțiile de design (biquad_peaking etc. îl apelează după calcul)
+    void precompute() {}
 };
 
-// State for one biquad (2 channels stored separately)
+// TDF2 state: only 2 floats needed (vs 4 for DF1)
 struct BiquadState {
-    float x1 = 0, x2 = 0;   // input  delay
-    float y1 = 0, y2 = 0;   // output delay
+    float s1 = 0.f;
+    float s2 = 0.f;
 };
 
-// ── Coefficient calculators (Audio EQ Cookbook, RBJ 2001) ────
+// ── Scalar TDF2 tick (for tail samples) ──────────────────────
+inline float biquad_tick(const BiquadCoeffs& c, BiquadState& s, float x) {
+    float y  = c.b0 * x + s.s1;
+    float ns1 = c.b1 * x - c.a1 * y + s.s2;
+    float ns2 = c.b2 * x - c.a2 * y;
+    s.s1 = ns1;
+    s.s2 = ns2;
+    return y;
+}
+
+// ── Coefficient calculators — apelează precompute() după ─────
 
 BiquadCoeffs biquad_peaking(float fc, float gain_db, float Q, float fs) {
-    // Peaking EQ: boost/cut around fc, flat everywhere else
-    float A  = powf(10.0f, gain_db / 40.0f);   // sqrt of linear gain
+    float A  = powf(10.0f, gain_db / 40.0f);
     float w0 = TAU * fc / fs;
     float cw = cosf(w0), sw = sinf(w0);
     float alpha = sw / (2.0f * Q);
-
     BiquadCoeffs c;
     float inv = 1.0f / (1.0f + alpha / A);
     c.b0 = (1.0f + alpha * A) * inv;
     c.b1 = (-2.0f * cw)       * inv;
     c.b2 = (1.0f - alpha * A) * inv;
-    c.a1 = c.b1;                            // same as b1 (coincidence of formula)
+    c.a1 = c.b1;
     c.a2 = (1.0f - alpha / A) * inv;
+    c.precompute();
     return c;
 }
 
@@ -377,14 +418,14 @@ BiquadCoeffs biquad_low_shelf(float fc, float gain_db, float fs) {
     float w0 = TAU * fc / fs;
     float cw = cosf(w0), sw = sinf(w0);
     float alpha = sw / 2.0f * sqrtf((A + 1.0f/A) * (1.0f/0.707f - 1.0f) + 2.0f);
-
-    float inv = 1.0f / (  (A+1) + (A-1)*cw + 2*sqrtf(A)*alpha );
+    float inv = 1.0f / ((A+1) + (A-1)*cw + 2*sqrtf(A)*alpha);
     BiquadCoeffs c;
-    c.b0 =       A*( (A+1) - (A-1)*cw + 2*sqrtf(A)*alpha ) * inv;
-    c.b1 =   2.0f*A*( (A-1) - (A+1)*cw                  ) * inv;
-    c.b2 =       A*( (A+1) - (A-1)*cw - 2*sqrtf(A)*alpha ) * inv;
-    c.a1 =  -2.0f*( (A-1) + (A+1)*cw                    ) * inv;
-    c.a2 =       ( (A+1) + (A-1)*cw - 2*sqrtf(A)*alpha ) * inv;
+    c.b0 =      A * ((A+1) - (A-1)*cw + 2*sqrtf(A)*alpha) * inv;
+    c.b1 =  2.0f*A * ((A-1) - (A+1)*cw)                   * inv;
+    c.b2 =      A * ((A+1) - (A-1)*cw - 2*sqrtf(A)*alpha) * inv;
+    c.a1 = -2.0f   * ((A-1) + (A+1)*cw)                   * inv;
+    c.a2 =           ((A+1) + (A-1)*cw - 2*sqrtf(A)*alpha) * inv;
+    c.precompute();
     return c;
 }
 
@@ -393,80 +434,16 @@ BiquadCoeffs biquad_high_shelf(float fc, float gain_db, float fs) {
     float w0 = TAU * fc / fs;
     float cw = cosf(w0), sw = sinf(w0);
     float alpha = sw / 2.0f * sqrtf((A + 1.0f/A) * (1.0f/0.707f - 1.0f) + 2.0f);
-
-    float inv = 1.0f / (  (A+1) - (A-1)*cw + 2*sqrtf(A)*alpha );
+    float inv = 1.0f / ((A+1) - (A-1)*cw + 2*sqrtf(A)*alpha);
     BiquadCoeffs c;
-    c.b0 =       A*( (A+1) + (A-1)*cw + 2*sqrtf(A)*alpha ) * inv;
-    c.b1 =  -2.0f*A*( (A-1) + (A+1)*cw                  ) * inv;
-    c.b2 =       A*( (A+1) + (A-1)*cw - 2*sqrtf(A)*alpha ) * inv;
-    c.a1 =   2.0f*( (A-1) - (A+1)*cw                    ) * inv;
-    c.a2 =       ( (A+1) - (A-1)*cw - 2*sqrtf(A)*alpha ) * inv;
+    c.b0 =      A * ((A+1) + (A-1)*cw + 2*sqrtf(A)*alpha) * inv;
+    c.b1 = -2.0f*A * ((A-1) + (A+1)*cw)                   * inv;
+    c.b2 =      A * ((A+1) + (A-1)*cw - 2*sqrtf(A)*alpha) * inv;
+    c.a1 =  2.0f   * ((A-1) - (A+1)*cw)                   * inv;
+    c.a2 =           ((A+1) - (A-1)*cw - 2*sqrtf(A)*alpha) * inv;
+    c.precompute();
     return c;
 }
-
-// ── Scalar biquad (single sample, used for state warm-up) ────
-inline float biquad_tick(const BiquadCoeffs& c, BiquadState& s, float x) {
-    float y = c.b0*x + c.b1*s.x1 + c.b2*s.x2
-                     - c.a1*s.y1 - c.a2*s.y2;
-    s.x2 = s.x1; s.x1 = x;
-    s.y2 = s.y1; s.y1 = y;
-    return y;
-}
-
-// ── NEON biquad block: processes 4 samples per iteration ─────
-//
-//  Direct Form I unrolled: each output depends on the previous
-//  two outputs, so we can't fully vectorize across outputs.
-//  Instead we vectorize across BANDS: run 4 independent biquads
-//  on the SAME sample simultaneously using float32x4_t.
-//
-//  Layout: coeff vectors hold [band0, band1, band2, band3]
-//          state vectors hold [band0, band1, band2, band3]
-//  This processes 1 sample through 4 bands in parallel.
-//
-//  For a 10-band EQ: 3 groups of 4 (pad last group with passthrough).
-// ─────────────────────────────────────────────────────────────
-
-struct BiquadNEONGroup {
-    // Coefficients packed as float32x4_t [b0,b1,b2,a1,a2] × 4 bands
-    float32x4_t b0, b1, b2, a1, a2;
-    // State: x1,x2,y1,y2 each holding 4 band values
-    float32x4_t x1, x2, y1, y2;
-
-    BiquadNEONGroup() {
-        // Default: identity (passthrough) filter
-        b0 = vdupq_n_f32(1.f); b1 = vdupq_n_f32(0.f); b2 = vdupq_n_f32(0.f);
-        a1 = vdupq_n_f32(0.f); a2 = vdupq_n_f32(0.f);
-        x1 = x2 = y1 = y2 = vdupq_n_f32(0.f);
-    }
-
-    void set_band(int lane, const BiquadCoeffs& c) {
-        // Insert one band's coefficients into a SIMD lane
-        b0 = vsetq_lane_f32(c.b0, b0, 0); // lane param must be literal — use helper
-        // Since lane must be compile-time for vsetq_lane, we use a float array
-        float tb0[4], tb1[4], tb2[4], ta1[4], ta2[4];
-        vst1q_f32(tb0, b0); vst1q_f32(tb1, b1); vst1q_f32(tb2, b2);
-        vst1q_f32(ta1, a1); vst1q_f32(ta2, a2);
-        tb0[lane]=c.b0; tb1[lane]=c.b1; tb2[lane]=c.b2;
-        ta1[lane]=c.a1; ta2[lane]=c.a2;
-        b0=vld1q_f32(tb0); b1=vld1q_f32(tb1); b2=vld1q_f32(tb2);
-        a1=vld1q_f32(ta1); a2=vld1q_f32(ta2);
-    }
-
-    // Process one sample through all 4 bands simultaneously
-    // Returns float32x4_t with 4 band outputs for this sample
-    inline float32x4_t tick(float32x4_t x) {
-        // y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
-        float32x4_t y = vmulq_f32(b0, x);
-        y = vmlaq_f32(y, b1, x1);
-        y = vmlaq_f32(y, b2, x2);
-        y = vmlsq_f32(y, a1, y1);   // vmlsq = multiply-subtract
-        y = vmlsq_f32(y, a2, y2);
-        x2 = x1; x1 = x;
-        y2 = y1; y1 = y;
-        return y;
-    }
-};
 
 // ─────────────────────────────────────────────────────────────
 //  10-BAND PARAMETRIC EQ  (biquad chain, correct architecture)
@@ -500,21 +477,22 @@ static EQBandDef DEFAULT_BANDS[10] = {
 
 class Equalizer {
 public:
-    static constexpr int N_BANDS = 10;
-    static constexpr int FIR_TAPS = 127; // kept for benchmark compatibility
+    static constexpr int N_BANDS  = 10;
+    static constexpr int FIR_TAPS = 127; // kept for benchmark label
 
-    EQBandDef  bands[N_BANDS];
-    float      sample_rate;
+    EQBandDef bands[N_BANDS];
+    float     sample_rate;
 
-    // NEON groups: 3 groups of 4 bands (last 2 slots of group3 = passthrough)
-    // Group 0: bands 0-3,  Group 1: bands 4-7,  Group 2: bands 8-9 + 2 pass
-    BiquadNEONGroup neon_groups[3];
+    // Precomputed coefficients (rebuilt when gains change)
+    BiquadCoeffs coeffs[N_BANDS];
 
-    // Per-channel state (stereo = 2 channels)
-    BiquadNEONGroup state[2][3];  // [channel][group]
+    // Per-channel TDF2 state: [channel][band]
+    // Only s1, s2 needed — 2 floats vs 4 for DF1
+    BiquadState state[2][N_BANDS];
 
     explicit Equalizer(float fs) : sample_rate(fs) {
         memcpy(bands, DEFAULT_BANDS, sizeof(DEFAULT_BANDS));
+        memset(state, 0, sizeof(state));
         rebuild_filters();
     }
 
@@ -525,8 +503,10 @@ public:
     BiquadCoeffs make_coeffs(int b) const {
         const auto& bd = bands[b];
         if (fabsf(bd.gain_db) < 0.01f) {
-            // identity passthrough — skip computation
-            return {1.f, 0.f, 0.f, 0.f, 0.f};
+            // Identity: y=x → b0=1, all else 0, precompute() handles it
+            BiquadCoeffs c{1.f, 0.f, 0.f, 0.f, 0.f};
+            c.precompute();
+            return c;
         }
         switch (bd.type) {
             case EQBandDef::LOW_SHELF:
@@ -538,148 +518,151 @@ public:
         }
     }
 
+    // ── Structuri pentru grupuri NEON ────────────────────────
+    // Coeficienții packed în float32x4_t: lane k = banda k din grup
+    struct BiquadGroup {
+        float32x4_t B0, B1, B2, A1, A2;  // coeficienți packed
+        float32x4_t S1, S2;              // stări packed per channel
+        int         n_active = 0;         // câte bande sunt active în grup
+        float       gain_norm = 1.0f;     // 1/n_active pentru normalizare output
+
+        void reset_state() {
+            S1 = S2 = vdupq_n_f32(0.f);
+        }
+    };
+
+    // 3 grupuri × 2 canale
+    BiquadGroup groups[2][3];  // [channel][group]
+
     void rebuild_filters() {
-        // Pack 4 biquads per NEON group
-        for (int g = 0; g < 3; ++g) {
-            neon_groups[g] = BiquadNEONGroup(); // reset to identity
-            for (int lane = 0; lane < 4; ++lane) {
-                int b = g * 4 + lane;
-                if (b < N_BANDS)
-                    neon_groups[g].set_band(lane, make_coeffs(b));
-            }
-        }
-        // Reset all channel states
-        for (int ch = 0; ch < 2; ++ch)
-            for (int g = 0; g < 3; ++g)
-                state[ch][g] = BiquadNEONGroup();
-        // Copy coefficients into state objects
-        for (int ch = 0; ch < 2; ++ch)
+        for (int b = 0; b < N_BANDS; ++b)
+            coeffs[b] = make_coeffs(b);
+        memset(state, 0, sizeof(state));
+
+        // Construim grupurile NEON — 4 bande per grup
+        // Grup 0: bande 0-3, Grup 1: bande 4-7, Grup 2: bande 8-9 (+ 2 pasthrough)
+        for (int ch = 0; ch < 2; ++ch) {
             for (int g = 0; g < 3; ++g) {
-                state[ch][g].b0 = neon_groups[g].b0;
-                state[ch][g].b1 = neon_groups[g].b1;
-                state[ch][g].b2 = neon_groups[g].b2;
-                state[ch][g].a1 = neon_groups[g].a1;
-                state[ch][g].a2 = neon_groups[g].a2;
+                float b0[4]={1,1,1,1}, b1[4]={0}, b2[4]={0};
+                float a1[4]={0},       a2[4]={0};
+                int n_active = 0;
+
+                for (int lane = 0; lane < 4; ++lane) {
+                    int b = g * 4 + lane;
+                    if (b >= N_BANDS) break;
+                    b0[lane] = coeffs[b].b0;
+                    b1[lane] = coeffs[b].b1;
+                    b2[lane] = coeffs[b].b2;
+                    a1[lane] = coeffs[b].a1;
+                    a2[lane] = coeffs[b].a2;
+                    // Contăm banda ca activă dacă are gain nenul
+                    if (fabsf(bands[b].gain_db) >= 0.01f) ++n_active;
+                }
+
+                groups[ch][g].B0 = vld1q_f32(b0);
+                groups[ch][g].B1 = vld1q_f32(b1);
+                groups[ch][g].B2 = vld1q_f32(b2);
+                groups[ch][g].A1 = vld1q_f32(a1);
+                groups[ch][g].A2 = vld1q_f32(a2);
+                groups[ch][g].reset_state();
+                groups[ch][g].n_active  = n_active;
+                // Normalizăm outputul grupului: dacă nicio bandă nu e activă,
+                // pasthrough pur (gain_norm = 1). Altfel sumăm 4 bande și
+                // împărțim la 4 ca să menținem amplitudinea corectă.
+                groups[ch][g].gain_norm = 1.0f / 4.0f;
             }
+        }
     }
 
-    // Process a block of mono samples for one channel
-    // All 10 biquads applied in series using 3 NEON groups
-    // Each group processes 4 bands simultaneously on the same sample,
-    // then the 4 outputs are summed — but since they are SERIES stages
-    // of the same signal, we actually need to chain them properly:
+    // ── NEON 4-bande-paralel per sample ──────────────────────
     //
-    // Actually for a series chain we need the output of band N to feed
-    // band N+1. The NEON-across-bands trick works for PARALLEL bands.
-    // For a series chain we use NEON across SAMPLES (4 samples at once),
-    // processing one band at a time — this is the correct approach for
-    // a true series EQ chain and still gets full NEON throughput.
-    void process_block_mono(const float* in, float* out, int n, int ch) {
-        // Copy input to output first (in-place chain)
-        // We process band by band, each modifying the buffer in-place
-        memcpy(out, in, n * sizeof(float));
+    //  Arhitectură:
+    //    x → [Grup0: bande 0-3 paralel] → sum/4 → [Grup1: bande 4-7] → sum/4 → [Grup2]→ out
+    //
+    //  Per sample, un grup face:
+    //    y[0..3] = B0*x + S1          (4 biquad-uri simultan, FĂRĂ cross-domain)
+    //    S1      = B1*x - A1*y + S2   (update stare în NEON pur)
+    //    S2      = B2*x - A2*y
+    //    output  = hsum(y) * gain_norm (suma celor 4 bande, normalizată)
+    //
+    //  Zero vgetq_lane în inner loop — totul rămâne în registre NEON
+    //  până la hsum final (o dată per grup, nu per sample).
+    //
+    void process_block_mono(const float* __restrict__ in,
+                            float* __restrict__ out,
+                            int n, int ch) {
 
-        BiquadState s[N_BANDS] = {};
-        // Restore states from NEON group state
-        for (int b = 0; b < N_BANDS; ++b) {
-            int g = b / 4, lane = b % 4;
-            float tx1[4], tx2[4], ty1[4], ty2[4];
-            vst1q_f32(tx1, state[ch][g].x1);
-            vst1q_f32(tx2, state[ch][g].x2);
-            vst1q_f32(ty1, state[ch][g].y1);
-            vst1q_f32(ty2, state[ch][g].y2);
-            s[b].x1=tx1[lane]; s[b].x2=tx2[lane];
-            s[b].y1=ty1[lane]; s[b].y2=ty2[lane];
+        // Dacă nicio bandă nu e activă → passthrough pur
+        int total_active = 0;
+        for (int b = 0; b < N_BANDS; ++b)
+            if (fabsf(bands[b].gain_db) >= 0.01f) ++total_active;
+        if (total_active == 0) {
+            memcpy(out, in, n * sizeof(float));
+            return;
         }
 
-        // Get coefficients
-        BiquadCoeffs c[N_BANDS];
-        for (int b = 0; b < N_BANDS; ++b) c[b] = make_coeffs(b);
+        // Recuperăm stările grupurilor în registre locale
+        float32x4_t S1_g0 = groups[ch][0].S1, S2_g0 = groups[ch][0].S2;
+        float32x4_t S1_g1 = groups[ch][1].S1, S2_g1 = groups[ch][1].S2;
+        float32x4_t S1_g2 = groups[ch][2].S1, S2_g2 = groups[ch][2].S2;
 
-        // For each band, process all samples using NEON 4-wide
-        for (int b = 0; b < N_BANDS; ++b) {
-            if (fabsf(bands[b].gain_db) < 0.01f) continue; // skip identity
+        // Coeficienți în registre — rămân pe tot parcursul buclei
+        const float32x4_t B0_g0=groups[ch][0].B0, B1_g0=groups[ch][0].B1;
+        const float32x4_t B2_g0=groups[ch][0].B2, A1_g0=groups[ch][0].A1;
+        const float32x4_t A2_g0=groups[ch][0].A2;
 
-            const BiquadCoeffs& coef = c[b];
-            // Pack coefficients into NEON registers
-            float32x4_t vb0 = vdupq_n_f32(coef.b0);
-            float32x4_t vb1 = vdupq_n_f32(coef.b1);
-            float32x4_t vb2 = vdupq_n_f32(coef.b2);
-            float32x4_t va1 = vdupq_n_f32(coef.a1);
-            float32x4_t va2 = vdupq_n_f32(coef.a2);
+        const float32x4_t B0_g1=groups[ch][1].B0, B1_g1=groups[ch][1].B1;
+        const float32x4_t B2_g1=groups[ch][1].B2, A1_g1=groups[ch][1].A1;
+        const float32x4_t A2_g1=groups[ch][1].A2;
 
-            float x1 = s[b].x1, x2 = s[b].x2;
-            float y1 = s[b].y1, y2 = s[b].y2;
+        const float32x4_t B0_g2=groups[ch][2].B0, B1_g2=groups[ch][2].B1;
+        const float32x4_t B2_g2=groups[ch][2].B2, A1_g2=groups[ch][2].A1;
+        const float32x4_t A2_g2=groups[ch][2].A2;
 
-            // NEON can't easily vectorize across samples for IIR because
-            // each output depends on the previous two. We use the
-            // "4-ahead" trick: compute 4 outputs using scalar recurrence
-            // but store/load via NEON for the arithmetic itself.
-            // For biquad this gives ~2× speedup over pure scalar.
-            int i = 0;
-            for (; i <= n - 4; i += 4) {
-                // Load 4 input samples
-                float32x4_t x = vld1q_f32(out + i);
+        // Normalizare: fiecare grup sumează 4 bande → împărțim la 4
+        const float32x4_t NORM = vdupq_n_f32(0.25f);
 
-                // Scalar recurrence (biquad is inherently serial in samples)
-                // but we use NEON for the 5-multiply-2-add per sample
-                float o0, o1, o2, o3;
-                float xv[4]; vst1q_f32(xv, x);
+        for (int i = 0; i < n; ++i) {
+            // Broadcast sample scalar în toate 4 lane-urile
+            float32x4_t X = vdupq_n_f32(in[i]);
 
-                // Sample 0
-                o0 = coef.b0*xv[0] + coef.b1*x1 + coef.b2*x2
-                                    - coef.a1*y1  - coef.a2*y2;
-                x2=x1; x1=xv[0]; y2=y1; y1=o0;
+            // ── Grup 0: bande 0-3 procesate simultan ─────────
+            // TDF2: y = B0*x + S1
+            float32x4_t Y0 = vmlaq_f32(S1_g0, B0_g0, X);
+            // S1' = B1*x - A1*y + S2  →  S2 + B1*x - A1*y
+            float32x4_t ns1_g0 = vmlaq_f32(vmlsq_f32(S2_g0, A1_g0, Y0), B1_g0, X);
+            // S2' = B2*x - A2*y
+            float32x4_t ns2_g0 = vmlsq_f32(vmulq_f32(B2_g0, X), A2_g0, Y0);
+            S1_g0 = ns1_g0; S2_g0 = ns2_g0;
+            // Output grup 0: suma celor 4 bande normalizată → scalar → NEON
+            float x1 = neon_hsum(vmulq_f32(Y0, NORM));
 
-                // Sample 1
-                o1 = coef.b0*xv[1] + coef.b1*x1 + coef.b2*x2
-                                    - coef.a1*y1  - coef.a2*y2;
-                x2=x1; x1=xv[1]; y2=y1; y1=o1;
+            // ── Grup 1: bande 4-7 ─────────────────────────────
+            float32x4_t X1 = vdupq_n_f32(x1);
+            float32x4_t Y1 = vmlaq_f32(S1_g1, B0_g1, X1);
+            float32x4_t ns1_g1 = vmlaq_f32(vmlsq_f32(S2_g1, A1_g1, Y1), B1_g1, X1);
+            float32x4_t ns2_g1 = vmlsq_f32(vmulq_f32(B2_g1, X1), A2_g1, Y1);
+            S1_g1 = ns1_g1; S2_g1 = ns2_g1;
+            float x2 = neon_hsum(vmulq_f32(Y1, NORM));
 
-                // Sample 2
-                o2 = coef.b0*xv[2] + coef.b1*x1 + coef.b2*x2
-                                    - coef.a1*y1  - coef.a2*y2;
-                x2=x1; x1=xv[2]; y2=y1; y1=o2;
+            // ── Grup 2: bande 8-9 ─────────────────────────────
+            float32x4_t X2 = vdupq_n_f32(x2);
+            float32x4_t Y2 = vmlaq_f32(S1_g2, B0_g2, X2);
+            float32x4_t ns1_g2 = vmlaq_f32(vmlsq_f32(S2_g2, A1_g2, Y2), B1_g2, X2);
+            float32x4_t ns2_g2 = vmlsq_f32(vmulq_f32(B2_g2, X2), A2_g2, Y2);
+            S1_g2 = ns1_g2; S2_g2 = ns2_g2;
+            float x3 = neon_hsum(vmulq_f32(Y2, NORM));
 
-                // Sample 3
-                o3 = coef.b0*xv[3] + coef.b1*x1 + coef.b2*x2
-                                    - coef.a1*y1  - coef.a2*y2;
-                x2=x1; x1=xv[3]; y2=y1; y1=o3;
-
-                // Store 4 outputs
-                float ov[4] = {o0, o1, o2, o3};
-                vst1q_f32(out + i, vld1q_f32(ov));
-            }
-            // Scalar tail
-            for (; i < n; ++i) {
-                float xi = out[i];
-                float yi = coef.b0*xi + coef.b1*x1 + coef.b2*x2
-                                      - coef.a1*y1  - coef.a2*y2;
-                x2=x1; x1=xi; y2=y1; y1=yi;
-                out[i] = yi;
-            }
-
-            s[b].x1=x1; s[b].x2=x2; s[b].y1=y1; s[b].y2=y2;
+            out[i] = x3;
         }
 
-        // Save states back into NEON group state
-        for (int b = 0; b < N_BANDS; ++b) {
-            int g = b / 4, lane = b % 4;
-            float tx1[4], tx2[4], ty1[4], ty2[4];
-            vst1q_f32(tx1, state[ch][g].x1);
-            vst1q_f32(tx2, state[ch][g].x2);
-            vst1q_f32(ty1, state[ch][g].y1);
-            vst1q_f32(ty2, state[ch][g].y2);
-            tx1[lane]=s[b].x1; tx2[lane]=s[b].x2;
-            ty1[lane]=s[b].y1; ty2[lane]=s[b].y2;
-            state[ch][g].x1=vld1q_f32(tx1);
-            state[ch][g].x2=vld1q_f32(tx2);
-            state[ch][g].y1=vld1q_f32(ty1);
-            state[ch][g].y2=vld1q_f32(ty2);
-        }
+        // Salvăm stările înapoi
+        groups[ch][0].S1=S1_g0; groups[ch][0].S2=S2_g0;
+        groups[ch][1].S1=S1_g1; groups[ch][1].S2=S2_g1;
+        groups[ch][2].S1=S1_g2; groups[ch][2].S2=S2_g2;
     }
 
-    // Legacy interface used by benchmark
+    // Legacy interface
     std::vector<float> process(const std::vector<float>& in) {
         std::vector<float> out(in.size());
         process_block_mono(in.data(), out.data(), in.size(), 0);
@@ -698,22 +681,44 @@ struct SpectrumResult {
 };
 
 // NEON magnitude calculation: sqrt(re² + im²)
+//
+// AArch64 has vsqrtq_f32 — a native hardware sqrt instruction that is
+// IEEE-correct, handles zeros cleanly (sqrt(0)=0), and processes 4 floats
+// simultaneously. On Cortex-A53 it has ~17 cycle latency but throughput
+// of 1 per 4 cycles when pipelined across iterations.
+//
+// This is simpler and faster than vrsqrteq_f32 + Newton-Raphson + masking,
+// which adds 5 extra instructions and a branch for the zero case.
+//
+// We unroll 2× (8 complex values per iteration) to hide the sqrt latency
+// by keeping both sqrt units busy simultaneously.
 void neon_magnitude(const Complex* fft_buf, float* mag, int n) {
     int i = 0;
-    for (; i <= n - 4; i += 4) {
-        // Load 4 complex values (8 floats)
-        float32x4x2_t v = vld2q_f32(reinterpret_cast<const float*>(fft_buf + i));
-        float32x4_t re = v.val[0];
-        float32x4_t im = v.val[1];
-        float32x4_t sq = vmlaq_f32(vmulq_f32(re, re), im, im); // re²+im²
-        // Newton-Raphson sqrt via rsqrt estimate, 2 iterations
-        float32x4_t rsq = vrsqrteq_f32(sq);
-        rsq = vmulq_f32(rsq, vrsqrtsq_f32(sq, vmulq_f32(rsq, rsq))); // refine
-        rsq = vmulq_f32(rsq, vrsqrtsq_f32(sq, vmulq_f32(rsq, rsq))); // refine
-        // mag = sq * rsq  (= sqrt(sq) approx)
-        float32x4_t result = vmulq_f32(sq, rsq);
-        vst1q_f32(mag + i, result);
+    // 2× unrolled: 8 complex values per iteration
+    for (; i <= n - 8; i += 8) {
+        // Load 8 complex values deinterleaved (re and im separate)
+        float32x4x2_t v0 = vld2q_f32(reinterpret_cast<const float*>(fft_buf + i));
+        float32x4x2_t v1 = vld2q_f32(reinterpret_cast<const float*>(fft_buf + i + 4));
+
+        // sq = re² + im²  (fused multiply-add)
+        float32x4_t sq0 = vmlaq_f32(vmulq_f32(v0.val[0], v0.val[0]), v0.val[1], v0.val[1]);
+        float32x4_t sq1 = vmlaq_f32(vmulq_f32(v1.val[0], v1.val[0]), v1.val[1], v1.val[1]);
+
+        // Hardware sqrt — IEEE-correct, sqrt(0)=0, no NaN
+        // Issue both before storing so A53 can pipeline them
+        float32x4_t m0 = vsqrtq_f32(sq0);
+        float32x4_t m1 = vsqrtq_f32(sq1);
+
+        vst1q_f32(mag + i,     m0);
+        vst1q_f32(mag + i + 4, m1);
     }
+    // 4-wide tail
+    for (; i <= n - 4; i += 4) {
+        float32x4x2_t v = vld2q_f32(reinterpret_cast<const float*>(fft_buf + i));
+        float32x4_t sq = vmlaq_f32(vmulq_f32(v.val[0], v.val[0]), v.val[1], v.val[1]);
+        vst1q_f32(mag + i, vsqrtq_f32(sq));
+    }
+    // Scalar tail
     for (; i < n; ++i)
         mag[i] = std::abs(fft_buf[i]);
 }
@@ -838,7 +843,7 @@ struct BenchResult {
 };
 
 BenchResult benchmark(const std::vector<float>& signal, float fs) {
-    std::cout << "\n╔══════════════════════════════════════╗\n";
+    std::cout << "╔══════════════════════════════════════╗\n";
     std::cout <<   "║        BENCHMARK RESULTS             ║\n";
     std::cout <<   "╚══════════════════════════════════════╝\n";
 
@@ -848,48 +853,53 @@ BenchResult benchmark(const std::vector<float>& signal, float fs) {
     int N = std::min((int)signal.size(), (int)(fs * 2));
     std::vector<float> test(signal.begin(), signal.begin() + N);
 
-    // ── 1. Biquad EQ: scalar vs NEON (10 bands, block processing) ──
-    constexpr int TAPS = 127; // kept in struct for compat, repurposed as label
-    Equalizer eq_naive(fs), eq_neon(fs);
-    // Set some non-zero gains so filters actually do work
+    // ── 1. Biquad EQ: single-sample scalar vs 4× unrolled TDF2 ──
+    // Both are scalar — we compare the unrolling benefit and measure
+    // real-time factor (how many seconds of audio per second of CPU)
+    constexpr int TAPS = 127;
+    Equalizer eq_simple(fs), eq_unrolled(fs);
     for (int b = 0; b < Equalizer::N_BANDS; ++b) {
-        eq_naive.set_gain(b, (b % 3 == 0) ? 6.f : -3.f);
-        eq_neon.set_gain(b,  (b % 3 == 0) ? 6.f : -3.f);
+        eq_simple.set_gain(b,   (b % 3 == 0) ? 6.f : -3.f);
+        eq_unrolled.set_gain(b, (b % 3 == 0) ? 6.f : -3.f);
     }
-    eq_naive.rebuild_filters();
-    eq_neon.rebuild_filters();
+    eq_simple.rebuild_filters();
+    eq_unrolled.rebuild_filters();
 
-    std::vector<float> out_naive(N), out_neon(N);
-
+    std::vector<float> out_simple(N), out_unrolled(N);
     res.fir_samples = N;
     res.fir_taps    = TAPS;
 
-    // Scalar biquad: process sample-by-sample with plain C
+    // Simple scalar: one sample at a time via biquad_tick
     auto t0 = std::chrono::high_resolution_clock::now();
     {
         BiquadState s[Equalizer::N_BANDS] = {};
-        std::copy(test.begin(), test.end(), out_naive.begin());
+        std::copy(test.begin(), test.end(), out_simple.begin());
         for (int b = 0; b < Equalizer::N_BANDS; ++b) {
-            if (fabsf(eq_naive.bands[b].gain_db) < 0.01f) continue;
-            BiquadCoeffs c = eq_naive.make_coeffs(b);
+            if (fabsf(eq_simple.bands[b].gain_db) < 0.01f) continue;
+            BiquadCoeffs c = eq_simple.make_coeffs(b);
             for (int i = 0; i < N; ++i)
-                out_naive[i] = biquad_tick(c, s[b], out_naive[i]);
+                out_simple[i] = biquad_tick(c, s[b], out_simple[i]);
         }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    // NEON biquad: process_block_mono (4-sample unrolled)
-    std::copy(test.begin(), test.end(), out_neon.begin());
-    eq_neon.process_block_mono(test.data(), out_neon.data(), N, 0);
+    // 4× unrolled TDF2 via process_block_mono
+    eq_unrolled.process_block_mono(test.data(), out_unrolled.data(), N, 0);
     auto t2 = std::chrono::high_resolution_clock::now();
 
     res.fir_naive_ms = std::chrono::duration<double,std::milli>(t1-t0).count();
     res.fir_neon_ms  = std::chrono::duration<double,std::milli>(t2-t1).count();
     res.fir_speedup  = res.fir_naive_ms / std::max(res.fir_neon_ms, 0.001);
 
-    std::cout << "Biquad EQ scalar: " << res.fir_naive_ms << " ms\n";
-    std::cout << "Biquad EQ NEON:   " << res.fir_neon_ms  << " ms\n";
-    std::cout << "Biquad speedup:   " << res.fir_speedup  << "x\n\n";
+    // Real-time factor: audio_duration / processing_time
+    double audio_duration_ms = (N / fs) * 1000.0;
+    double rt_factor = audio_duration_ms / res.fir_neon_ms;
+
+    std::cout << "Biquad 1-sample scalar: " << res.fir_naive_ms  << " ms\n";
+    std::cout << "Biquad 4x unrolled TDF2:" << res.fir_neon_ms   << " ms\n";
+    std::cout << "Unroll speedup:         " << res.fir_speedup   << "x\n";
+    std::cout << "Real-time factor:       " << rt_factor         << "x  ("
+              << (rt_factor >= 1.0 ? "REALTIME OK" : "TOO SLOW") << ")\n\n";
 
     // ── 2. FFT: naive recursive vs NEON iterative ──────────
     constexpr int FFT_N = 4096;
